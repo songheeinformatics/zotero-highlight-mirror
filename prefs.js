@@ -7,3 +7,5 @@ pref("extensions.highlightmirror.useNoteColor", true);
 pref("extensions.highlightmirror.commentMode", "translation");
 pref("extensions.highlightmirror.removeOrphans", false);
 pref("extensions.highlightmirror.targetLang", "한국어");
+pref("extensions.highlightmirror.autoTranslate", true);
+pref("extensions.highlightmirror.maxPages", 60);

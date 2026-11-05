@@ -92,14 +92,91 @@ var HighlightMirror = {
 	notifier: {
 		notify(event, type, ids, _extra) {
 			if (type !== "item" || !["add", "modify"].includes(event)) return;
-			if (!HighlightMirror.pref("autoSync")) return;
+			let HM = HighlightMirror;
 			for (let id of ids) {
 				let item = Zotero.Items.get(id);
-				if (!item || !item.isNote() || !item.parentItemID) continue;
-				if (item.getNote().indexOf("background-color") === -1) continue;
-				HighlightMirror.scheduleSync(item.id);
+				if (!item) continue;
+				// 번역 노트의 하이라이트 → PDF 주석
+				if (item.isNote() && item.parentItemID && HM.pref("autoSync")) {
+					if (item.getNote().indexOf("background-color") !== -1) HM.scheduleSync(item.id);
+				}
+				// 새 PDF 첨부 → 번역 노트
+				else if (event === "add" && item.isAttachment() && item.parentItemID && HM.pref("autoTranslate")) {
+					if (item.isPDFAttachment()) HM.scheduleTranslate(item.id);
+				}
 			}
 		},
+	},
+
+	/**
+	 * PDF가 새로 추가되면 파일이 실제로 내려온 뒤 번역을 시작한다.
+	 * (웹에서 저장하면 아이템이 먼저 생기고 파일은 몇 초 뒤 도착하므로 재시도)
+	 */
+	scheduleTranslate(attachmentID, attempt = 0) {
+		let win = this.win();
+		let key = `t${attachmentID}`;
+		if (this._timers.has(key)) win.clearTimeout(this._timers.get(key));
+		let delay = attempt === 0 ? 8000 : 15000;
+		this._timers.set(key, win.setTimeout(async () => {
+			this._timers.delete(key);
+			let att = Zotero.Items.get(attachmentID);
+			if (!att || !att.parentItemID) return;
+			let path = await att.getFilePathAsync();
+			if (!path) {
+				if (attempt < 12) this.scheduleTranslate(attachmentID, attempt + 1);
+				else this.log(`autoTranslate: file never arrived for ${att.key}`);
+				return;
+			}
+			let parent = Zotero.Items.get(att.parentItemID);
+			try {
+				await this.autoTranslate(parent, att);
+			}
+			catch (e) {
+				this.log(`autoTranslate failed: ${e}\n${e.stack || ""}`);
+				this.notify("자동 번역 실패", String(e.message || e), 10000);
+			}
+		}, delay));
+	},
+
+	hasTranslationNote(parent) {
+		return Zotero.Items.get(parent.getNotes()).some(n => n.getTags().some(t => t.tag === this.TAG));
+	},
+
+	/** 자동 번역 전 검사: 키, 중복, 길이, 언어 */
+	async autoTranslate(parent, pdf) {
+		if (!(this.pref("apiKey") || "").trim()) {
+			this.log("autoTranslate: no API key, skipping");
+			return;
+		}
+		if (this.hasTranslationNote(parent)) {
+			this.log(`autoTranslate: ${parent.key} already has a translation note`);
+			return;
+		}
+		let pages = await this.pdfText.getPages(pdf);
+		let maxPages = Number(this.pref("maxPages")) || 60;
+		if (pages.length > maxPages) {
+			this.notify("자동 번역 건너뜀", `${pages.length}쪽은 설정된 한도(${maxPages}쪽)를 넘습니다. 필요하면 우클릭 메뉴로 직접 실행하세요.`, 10000);
+			return;
+		}
+		let sample = pages.slice(0, 3).map(p => p.text).join(" ");
+		if (this.looksLikeTargetLanguage(sample)) {
+			this.log(`autoTranslate: ${parent.key} already in target language, skipping`);
+			return;
+		}
+		await this.translateItem(parent, { pages });
+	},
+
+	/** 대상 언어(기본 한국어)로 이미 쓰인 문서인지 — 한글 비율로 판단 */
+	looksLikeTargetLanguage(text) {
+		let lang = (this.pref("targetLang") || "한국어");
+		let letters = (text.match(/\p{L}/gu) || []).length;
+		if (!letters) return false;
+		let re = /한국어|korean/i.test(lang) ? /\p{Script=Hangul}/gu
+			: /日本語|japanese/i.test(lang) ? /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/gu
+			: /中文|chinese/i.test(lang) ? /\p{Script=Han}/gu
+			: null;
+		if (!re) return false;
+		return (text.match(re) || []).length / letters > 0.2;
 	},
 
 	scheduleSync(noteID) {
@@ -329,13 +406,13 @@ var HighlightMirror = {
 	},
 
 	// ---------------------------------------------- 2) PDF → translation note
-	async translateItem(parent) {
+	async translateItem(parent, { pages } = {}) {
 		let pdf = await this.findPDF(parent);
 		if (!pdf) {
 			this.notify("PDF 없음", "선택한 아이템에 PDF 첨부가 없습니다.");
 			return;
 		}
-		let pages = await this.pdfText.getPages(pdf);
+		pages = pages || await this.pdfText.getPages(pdf);
 		let paragraphs = this.pdfText.toParagraphs(pages);
 		let lang = this.pref("targetLang") || "한국어";
 		let title = parent.getField("title");
@@ -599,11 +676,43 @@ var HighlightMirror = {
 			return out;
 		},
 
+		/** 출판사 표지(인용 안내·약관 페이지)인지 */
+		isCoverPage(page) {
+			let t = page.text;
+			return /To cite this article|To link to this article|Full Terms & Conditions|Terms of Use|Downloaded from|This content downloaded/i.test(t)
+				&& page.index === 0;
+		},
+
+		/**
+		 * 여러 페이지에 반복되는 줄(머리글·꼬리글), 쪽번호만 있는 줄을 골라낸다.
+		 * @returns {Set<string>} 제거할 줄의 정규화 키
+		 */
+		runningLines(pages) {
+			let count = new Map();
+			let norm = s => s.replace(/\d+/g, "#").replace(/\s+/g, " ").trim().toLowerCase();
+			for (let p of pages) {
+				let seen = new Set();
+				for (let line of p.text.split("\n")) {
+					let k = norm(line);
+					if (k.length < 3 || k.length > 90 || seen.has(k)) continue;
+					seen.add(k);
+					count.set(k, (count.get(k) || 0) + 1);
+				}
+			}
+			let drop = new Set();
+			let threshold = Math.max(3, Math.ceil(pages.length * 0.25));
+			for (let [k, n] of count) if (n >= threshold) drop.add(k);
+			return { drop, norm };
+		},
+
 		/** 페이지 텍스트를 단락으로 쪼갠다(빈 줄/문장 끝 + 짧은 줄 휴리스틱). */
 		toParagraphs(pages) {
 			let paras = [];
+			let { drop, norm } = this.runningLines(pages);
 			for (let p of pages) {
-				let lines = p.text.split("\n").map(s => s.trim()).filter(Boolean);
+				if (this.isCoverPage(p)) continue;
+				let lines = p.text.split("\n").map(s => s.trim()).filter(Boolean)
+					.filter(l => !drop.has(norm(l)) && !/^\d{1,4}$/.test(l));
 				let buf = [];
 				for (let i = 0; i < lines.length; i++) {
 					let line = lines[i];
@@ -870,7 +979,8 @@ var HighlightMirror = {
 			for (let r of arr) {
 				let p = paras[(r.id | 0) - 1];
 				if (!p || !r.ko) continue;
-				out.push({ page: p.page, kind: p.kind, src: String(r.src || p.text.split(/\s+/).slice(0, 10).join(" ")), ko: String(r.ko) });
+				let src = String(r.src || p.text).split(/\s+/).slice(0, 12).join(" ");
+				out.push({ page: p.page, kind: p.kind, src, ko: String(r.ko) });
 			}
 			return out;
 		},

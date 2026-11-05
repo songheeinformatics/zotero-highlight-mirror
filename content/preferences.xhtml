@@ -48,9 +48,13 @@
 
   <groupbox>
     <label><html:h2 style="margin:4px 0">번역 노트 생성</html:h2></label>
-    <hbox align="center" style="gap:8px">
+    <checkbox label="PDF가 새로 추가되면 자동으로 번역 노트 만들기 (API 키가 있고, 번역 노트가 없고, 원문이 번역 언어가 아닐 때만)"
+              preference="extensions.highlightmirror.autoTranslate" native="true"/>
+    <hbox align="center" style="gap:8px; margin-top:4px">
       <label value="번역 언어" style="min-width: 7em"/>
       <html:input type="text" style="width: 10em" preference="extensions.highlightmirror.targetLang"/>
+      <label value="자동 번역 최대 쪽수" style="margin-left: 12px"/>
+      <html:input type="number" min="1" max="500" style="width: 5em" preference="extensions.highlightmirror.maxPages"/>
     </hbox>
     <html:p style="margin:6px 0 0; color: var(--fill-secondary);">
       번역은 단락 단위로 요청되며 원문 단락과의 대응표가 함께 저장됩니다. 결과는 사용자의 라이브러리 안에만 저장됩니다(개인 연구용).

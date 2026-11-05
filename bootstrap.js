@@ -12,7 +12,11 @@ function install() {}
 async function startup({ id, version, rootURI }) {
 	await Zotero.initializationPromise;
 
-	Services.scriptloader.loadSubScript(rootURI + "content/highlightMirror.js");
+	// ignoreCache: 개발 중 소스 폴더를 직접 올려 쓸 때 시작 캐시의 옛 코드가 로드되는 것을 막는다
+	Services.scriptloader.loadSubScriptWithOptions(rootURI + "content/highlightMirror.js", {
+		target: globalThis,
+		ignoreCache: true,
+	});
 	HighlightMirror.init({ id, version, rootURI });
 	Zotero.HighlightMirror = HighlightMirror; // 설정창(preferences.xhtml)에서 접근용
 
