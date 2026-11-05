@@ -1,0 +1,16 @@
+{
+  "manifest_version": 2,
+  "name": "Highlight Mirror",
+  "version": "0.1.0",
+  "description": "번역 노트의 하이라이트를 원문 PDF 주석으로 미러링하고, Claude API로 번역 노트를 만듭니다.",
+  "author": "songhee",
+  "homepage_url": "https://github.com/songheeinformatics/zotero-highlight-mirror",
+  "applications": {
+    "zotero": {
+      "id": "highlight-mirror@songhee.kr",
+      "update_url": "https://raw.githubusercontent.com/songheeinformatics/zotero-highlight-mirror/main/updates.json",
+      "strict_min_version": "7.0",
+      "strict_max_version": "10.*"
+    }
+  }
+}

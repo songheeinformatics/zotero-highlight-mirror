@@ -1,0 +1,17 @@
+{
+  "addons": {
+    "highlight-mirror@songhee.kr": {
+      "updates": [
+        {
+          "version": "0.1.0",
+          "update_link": "https://github.com/songheeinformatics/zotero-highlight-mirror/releases/download/v0.1.0/highlight-mirror-0.1.0.xpi",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "7.0"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

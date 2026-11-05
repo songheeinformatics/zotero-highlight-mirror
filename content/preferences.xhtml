@@ -1,0 +1,64 @@
+<vbox xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+      xmlns:html="http://www.w3.org/1999/xhtml"
+      id="highlight-mirror-prefs" style="padding: 8px 12px; gap: 12px;">
+
+  <groupbox>
+    <label><html:h2 style="margin:4px 0">Claude API</html:h2></label>
+    <html:p style="margin:2px 0 8px; color: var(--fill-secondary);">
+      키는 이 컴퓨터의 Zotero 설정에만 저장되며, 요청은 api.anthropic.com 으로만 전송됩니다.
+    </html:p>
+    <hbox align="center" style="gap:8px">
+      <label value="API 키" style="min-width: 7em"/>
+      <html:input id="hm-apikey" type="password" style="width: 30em"
+                  preference="extensions.highlightmirror.apiKey"/>
+    </hbox>
+    <hbox align="center" style="gap:8px; margin-top:6px">
+      <label value="모델" style="min-width: 7em"/>
+      <menulist id="hm-model" preference="extensions.highlightmirror.model" native="true">
+        <menupopup>
+          <menuitem label="Claude Opus 5.5 (권장)" value="claude-opus-5-5"/>
+          <menuitem label="Claude Sonnet 5.5 (빠르고 저렴)" value="claude-sonnet-5-5"/>
+          <menuitem label="Claude Haiku 5.5 (가장 저렴)" value="claude-haiku-5-5"/>
+        </menupopup>
+      </menulist>
+      <button label="연결 테스트" oncommand="Zotero.HighlightMirror.prefs.testConnection(window)"/>
+    </hbox>
+  </groupbox>
+
+  <groupbox>
+    <label><html:h2 style="margin:4px 0">하이라이트 미러링</html:h2></label>
+    <checkbox label="번역 노트가 바뀌면 자동으로 PDF 하이라이트 갱신"
+              preference="extensions.highlightmirror.autoSync" native="true"/>
+    <checkbox label="노트 하이라이트 색을 PDF 주석에 그대로 사용"
+              preference="extensions.highlightmirror.useNoteColor" native="true"/>
+    <hbox align="center" style="gap:8px; margin-top:4px">
+      <label value="기본 색" style="min-width: 7em"/>
+      <html:input type="color" preference="extensions.highlightmirror.color"/>
+    </hbox>
+    <hbox align="center" style="gap:8px; margin-top:4px">
+      <label value="주석 댓글" style="min-width: 7em"/>
+      <radiogroup orient="horizontal" preference="extensions.highlightmirror.commentMode">
+        <radio label="번역문(노트 하이라이트)" value="translation"/>
+        <radio label="없음" value="none"/>
+      </radiogroup>
+    </hbox>
+    <checkbox label="노트에서 지운 하이라이트는 PDF 주석도 삭제 (이 플러그인이 만든 것만)"
+              preference="extensions.highlightmirror.removeOrphans" native="true"/>
+  </groupbox>
+
+  <groupbox>
+    <label><html:h2 style="margin:4px 0">번역 노트 생성</html:h2></label>
+    <hbox align="center" style="gap:8px">
+      <label value="번역 언어" style="min-width: 7em"/>
+      <html:input type="text" style="width: 10em" preference="extensions.highlightmirror.targetLang"/>
+    </hbox>
+    <html:p style="margin:6px 0 0; color: var(--fill-secondary);">
+      번역은 단락 단위로 요청되며 원문 단락과의 대응표가 함께 저장됩니다. 결과는 사용자의 라이브러리 안에만 저장됩니다(개인 연구용).
+    </html:p>
+  </groupbox>
+
+  <hbox style="gap:8px">
+    <button label="디버그 로그 보기" oncommand="Zotero.HighlightMirror.prefs.openDebug(window)"/>
+    <button label="이 플러그인이 만든 주석 모두 삭제…" oncommand="Zotero.HighlightMirror.prefs.purgeAll(window)"/>
+  </hbox>
+</vbox>
