@@ -44,15 +44,41 @@
 
 기본 모델은 `claude-opus-5-5`입니다. 비용을 줄이려면 설정에서 Sonnet 5.5나 Haiku 5.5로 바꿀 수 있습니다. 하이라이트 매칭 한 번은 논문 전문(약 1만~2만 토큰)을 보내므로 Opus 기준 수십 원, 전문 번역은 수백 원 정도입니다.
 
-## 처음 설치 후 꼭 확인할 것
+## 검증 상태
 
-이 뼈대는 Zotero 밖(Node)에서 매처와 문법만 검증했고, Zotero 안에서는 아직 돌려보지 않았습니다. 다음 순서로 확인하세요.
+Zotero 10.0.7(Windows)에서 확인한 것:
 
-1. 설정 → 연결 테스트가 "연결 성공"을 띄우는지
-2. 번역 노트가 있는 아이템에서 **노트 하이라이트 → PDF 주석** 실행 → 진행 알림과 "완료" 알림
-3. 실패하면 설정 → **디버그 로그 보기** 에서 `[HighlightMirror]` 줄 확인
+- 플러그인 로드, 메뉴·설정창 등록, Notifier 등록
+- 내장 pdf.js 5.7.0 로딩 (창 컨텍스트 `import()` 경로로 성공, `ChromeUtils.importESModule`은 실패 → 로그에 남음)
+- 15쪽 논문에서 단어 6,865개 좌표 추출, 줄 끝 하이픈으로 갈라진 문장과 긴 문장 안의 짧은 구절 모두 적중
+- 번역 노트에서 하이라이트 9개 추출 (색 포함)
 
-가장 먼저 의심할 곳은 `content/highlightMirror.js`의 `pdfText.getLib()`입니다. pdf.js 모듈 로딩을 두 가지 경로(`ChromeUtils.importESModule`, 창 컨텍스트 `import()`)로 시도하는데, Zotero 버전에 따라 둘 다 막히면 세 번째 경로(숨은 iframe에서 로드)를 추가해야 합니다. 로그에 어느 경로가 성공했는지 남습니다.
+아직 사용자 환경에서 확인이 필요한 것: Claude 호출이 들어가는 실제 동기화와 번역 노트 생성(API 키 필요).
+
+문제가 생기면 설정 → **디버그 로그 보기** 에서 `[HighlightMirror]` 줄을 보거나, 아래 로컬 엔드포인트로 단계별 확인을 할 수 있습니다.
+
+## 로컬 테스트 엔드포인트
+
+Zotero 커넥터 서버(기본 `http://localhost:23119`, 이 컴퓨터에서만 접근 가능)에 다음 경로가 추가됩니다. 외부 스크립트나 다른 도구에서 미러링을 트리거할 때도 쓸 수 있습니다.
+
+| 경로 | 설명 |
+|---|---|
+| `GET /highlight-mirror/status` | 버전, 모델, 키 유무, pdf.js 로딩 상태 |
+| `GET /highlight-mirror/locate?item=<PDF key>&q=<원문 구절>[&page=n]` | 좌표 매칭 드라이런 (Claude 호출 없음) |
+| `GET /highlight-mirror/highlights?note=<note key>` | 노트에서 뽑은 하이라이트 목록 |
+| `POST /highlight-mirror/sync` `{"note":"<note key>"}` | 실제 미러링 실행, 처리 상태 반환 |
+| `POST /highlight-mirror/translate` `{"item":"<parent key>"}` | 번역 노트 생성 |
+
+```bash
+curl "http://localhost:23119/highlight-mirror/status"
+```
+
+## 개발용 설치 (xpi 없이 소스 폴더를 바로)
+
+1. Zotero 종료
+2. 프로필 폴더(`%APPDATA%\Zotero\Zotero\Profiles\<xxx>.default`)의 `extensions/` 안에 `highlight-mirror@songhee.kr` 라는 **확장자 없는 텍스트 파일**을 만들고, 내용으로 이 저장소 폴더의 절대 경로(끝에 `\`)만 적는다
+3. 같은 프로필의 `prefs.js`에서 `extensions.lastAppBuildId`, `extensions.lastAppVersion` 줄을 지우고 `user_pref("extensions.autoDisableScopes", 0);` 을 추가한다 (사이드로드 플러그인이 자동 비활성되는 것을 막음)
+4. Zotero 실행. 코드를 고친 뒤에는 Zotero를 다시 시작하면 반영된다
 
 ## 배포
 

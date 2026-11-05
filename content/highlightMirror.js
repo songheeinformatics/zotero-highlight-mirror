@@ -60,12 +60,14 @@ var HighlightMirror = {
 		this._notifierID = Zotero.Notifier.registerObserver(
 			this.notifier, ["item"], "highlightMirror");
 		await this.state.ensureDir();
+		this.server.register();
 	},
 
 	shutdown() {
 		if (this._notifierID) {
 			Zotero.Notifier.unregisterObserver(this._notifierID);
 		}
+		this.server.unregister();
 		for (let t of this._timers.values()) {
 			this.win().clearTimeout(t);
 		}
@@ -949,6 +951,120 @@ var HighlightMirror = {
 
 		async saveMapping(note, data) {
 			await HighlightMirror.io.writeJSON(this.file("map", note), data);
+		},
+	},
+
+	// ======================================================================= server
+	/**
+	 * 로컬 HTTP 엔드포인트 (Zotero 커넥터 포트, 기본 23119, localhost 전용).
+	 * 테스트·외부 자동화용. 예:
+	 *   GET  /highlight-mirror/status
+	 *   GET  /highlight-mirror/locate?item=<PDF key>&q=<원문 구절>        (드라이런: 좌표만 계산)
+	 *   GET  /highlight-mirror/highlights?note=<note key>                 (노트에서 뽑은 하이라이트)
+	 *   POST /highlight-mirror/sync      {"note": "<note key>"}            (실제 주석 생성)
+	 *   POST /highlight-mirror/translate {"item": "<parent key>"}          (번역 노트 생성)
+	 */
+	server: {
+		PATHS: ["/highlight-mirror/status", "/highlight-mirror/locate", "/highlight-mirror/highlights",
+			"/highlight-mirror/sync", "/highlight-mirror/translate"],
+
+		register() {
+			if (!Zotero.Server || !Zotero.Server.Endpoints) return;
+			for (let path of this.PATHS) {
+				let handler = this.handlers[path.split("/").pop()];
+				Zotero.Server.Endpoints[path] = function () {
+					this.supportedMethods = ["GET", "POST"];
+					this.supportedDataTypes = ["application/json", "application/x-www-form-urlencoded", "text/plain"];
+					this.permitBookmarklet = false;
+					this.init = async (options) => {
+						try {
+							let params = Object.fromEntries(options.searchParams?.entries?.() || []);
+							let data = options.data;
+							if (typeof data === "string" && data.trim()) {
+								try { data = JSON.parse(data); } catch (e) { /* keep string */ }
+							}
+							if (data && typeof data === "object") Object.assign(params, data);
+							let result = await handler(params);
+							return [200, "application/json", JSON.stringify(result, null, 1)];
+						}
+						catch (e) {
+							HighlightMirror.log(`endpoint error: ${e}\n${e.stack || ""}`);
+							return [500, "application/json", JSON.stringify({ error: String(e.message || e) })];
+						}
+					};
+				};
+			}
+			HighlightMirror.log("endpoints registered");
+		},
+
+		unregister() {
+			if (!Zotero.Server || !Zotero.Server.Endpoints) return;
+			for (let path of this.PATHS) delete Zotero.Server.Endpoints[path];
+		},
+
+		byKey(key) {
+			let lib = Zotero.Libraries.userLibraryID;
+			let item = Zotero.Items.getByLibraryAndKey(lib, key);
+			if (!item) throw new Error(`item not found: ${key}`);
+			return item;
+		},
+
+		handlers: {
+			async status() {
+				let HM = HighlightMirror;
+				let pdfjs = null;
+				try {
+					let lib = await HM.pdfText.getLib();
+					pdfjs = { ok: true, version: lib.version || null };
+				}
+				catch (e) {
+					pdfjs = { ok: false, error: String(e.message || e) };
+				}
+				return {
+					plugin: "highlight-mirror",
+					version: HM.version,
+					zotero: Zotero.version,
+					model: HM.pref("model"),
+					hasApiKey: !!(HM.pref("apiKey") || "").trim(),
+					autoSync: HM.pref("autoSync"),
+					stateDir: HM.state.dir(),
+					pdfjs,
+				};
+			},
+
+			async locate(p) {
+				let HM = HighlightMirror;
+				let pdf = HM.server.byKey(p.item);
+				if (!pdf.isPDFAttachment()) throw new Error("item is not a PDF attachment");
+				let pages = await HM.pdfText.getPages(pdf);
+				let hint = p.page !== undefined ? parseInt(p.page, 10) : undefined;
+				let m = p.q ? HM.matcher.findInDocument(pages, p.q, hint) : null;
+				return {
+					pages: pages.length,
+					words: pages.reduce((n, pg) => n + pg.words.length, 0),
+					match: m,
+					sample: pages[0]?.text.slice(0, 200),
+				};
+			},
+
+			async highlights(p) {
+				let note = HighlightMirror.server.byKey(p.note);
+				if (!note.isNote()) throw new Error("item is not a note");
+				return HighlightMirror.noteParser.extract(note.getNote());
+			},
+
+			async sync(p) {
+				let note = HighlightMirror.server.byKey(p.note);
+				if (!note.isNote()) throw new Error("item is not a note");
+				await HighlightMirror.syncNote(note, { manual: p.manual !== "false" && p.manual !== false });
+				return await HighlightMirror.state.loadNote(note);
+			},
+
+			async translate(p) {
+				let parent = HighlightMirror.server.byKey(p.item);
+				await HighlightMirror.translateItem(parent);
+				return { ok: true, notes: parent.getNotes().length };
+			},
 		},
 	},
 
