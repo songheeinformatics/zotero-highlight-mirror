@@ -416,6 +416,99 @@ var HighlightMirror = {
 	},
 
 	// ---------------------------------------------- 2) PDF → translation note
+	/** 노트 머리에 쓸 서지정보 */
+	paperMeta(parent) {
+		let creators = [];
+		try {
+			for (let c of parent.getCreatorsJSON()) {
+				if (c.creatorType && c.creatorType !== "author") continue;
+				creators.push(c.name || [c.firstName, c.lastName].filter(Boolean).join(" "));
+			}
+		}
+		catch (e) { /* ignore */ }
+		let date = parent.getField("date") || "";
+		let year = (date.match(/\d{4}/) || [""])[0];
+		return {
+			authors: creators.join(", "),
+			year,
+			journal: parent.getField("publicationTitle") || "",
+			doi: (parent.getField("DOI") || "").replace(/^https?:\/\/(dx\.)?doi\.org\//i, ""),
+		};
+	},
+
+	/** **굵게** 표기를 strong으로 바꾸며 이스케이프 */
+	inline(text) {
+		return this.escape(String(text ?? "")).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+	},
+
+	/**
+	 * Claude가 돌려준 구조 블록 하나를 노트 HTML로 만든다.
+	 * leaves: noteParser가 세는 leaf 블록(p/li/h/td/th)들의 텍스트, 문서 순서대로(대응표 인덱스와 맞춤).
+	 */
+	renderBlock(b) {
+		const I = (t) => this.inline(t);
+		let leaves = [];
+		let html = "";
+		let items = Array.isArray(b.items) ? b.items.map(x => String(x ?? "")).filter(x => x.trim()) : [];
+		switch (b.type) {
+			case "skip":
+				return null;
+			case "h1": case "h2": case "h3": {
+				if (!b.text) return null;
+				html = `<${b.type}>${I(b.text)}</${b.type}>`;
+				leaves.push(b.text);
+				break;
+			}
+			case "ul": case "ol": {
+				if (!items.length) return null;
+				html = `<${b.type}>\n${items.map(x => `<li>${I(x)}</li>`).join("\n")}\n</${b.type}>`;
+				leaves.push(...items);
+				break;
+			}
+			case "quote": {
+				if (!b.text) return null;
+				html = `<blockquote>\n<p>${I(b.text)}</p>\n</blockquote>`;
+				leaves.push(b.text);
+				break;
+			}
+			case "table": {
+				let header = Array.isArray(b.header) ? b.header.map(x => String(x ?? "")) : [];
+				let rows = Array.isArray(b.rows) ? b.rows.filter(Array.isArray).map(r => r.map(x => String(x ?? ""))) : [];
+				if (!header.length && !rows.length) return null;
+				let parts = [];
+				if (b.caption) { parts.push(`<h2>${I(b.caption)}</h2>`); leaves.push(b.caption); }
+				let trs = [];
+				if (header.length) {
+					trs.push(`<tr>${header.map(x => `<th><p>${I(x)}</p></th>`).join("")}</tr>`);
+					leaves.push(...header);
+				}
+				for (let r of rows) {
+					trs.push(`<tr>${r.map(x => `<td><p>${I(x)}</p></td>`).join("")}</tr>`);
+					leaves.push(...r);
+				}
+				parts.push(`<table>\n<tbody>\n${trs.join("\n")}\n</tbody>\n</table>`);
+				if (b.note) { parts.push(`<p><em>${I(b.note)}</em></p>`); leaves.push(b.note); }
+				html = parts.join("\n");
+				break;
+			}
+			case "figure": {
+				let parts = [];
+				if (b.caption) { parts.push(`<h2>${I(b.caption)}</h2>`); leaves.push(b.caption); }
+				if (items.length) { parts.push(`<ul>\n${items.map(x => `<li>${I(x)}</li>`).join("\n")}\n</ul>`); leaves.push(...items); }
+				else if (b.text) { parts.push(`<p>${I(b.text)}</p>`); leaves.push(b.text); }
+				if (!parts.length) return null;
+				html = parts.join("\n");
+				break;
+			}
+			default: {
+				if (!b.text) return null;
+				html = `<p>${I(b.text)}</p>`;
+				leaves.push(b.text);
+			}
+		}
+		return { html, leaves };
+	},
+
 	async translateItem(parent, { pages } = {}) {
 		let pdf = await this.findPDF(parent);
 		if (!pdf) {
@@ -425,9 +518,16 @@ var HighlightMirror = {
 		let lang = this.pref("targetLang") || "한국어";
 		let title = parent.getField("title");
 
-		// 1) 노트를 먼저 만들어 바로 보이게 하고, 구간이 끝날 때마다 단락을 덧붙인다
-		let head = `<h1>[${lang} 번역] ${this.escape(title)}</h1>\n`
-			+ `<p><em>Highlight Mirror가 Claude API로 만든 개인 연구용 번역입니다. 하이라이트하면 원문 PDF에 같은 자리로 주석이 달립니다.</em></p>`;
+		// 1) 노트를 먼저 만들어 바로 보이게 하고, 구간이 끝날 때마다 블록을 덧붙인다
+		let meta = this.paperMeta(parent);
+		let headParas = [
+			`<p><em>Highlight Mirror가 Claude API로 만든 개인 연구용 번역입니다. 하이라이트하면 원문 PDF에 같은 자리로 주석이 달립니다.</em></p>`,
+			`<p>${this.escape(meta.authors ? meta.authors + " " : "")}${meta.year ? `(${meta.year}) ` : ""}“${this.escape(title)}” 전문 ${lang} 번역. 원문의 절 구성·표·그림·목록·인용을 유지하고, 인용문헌의 저자명과 서지정보는 원문 표기를 둔다.</p>`,
+		];
+		if (meta.journal) headParas.push(`<p>게재지: ${this.escape(meta.journal)}${meta.year ? ` (${meta.year})` : ""}</p>`);
+		if (meta.doi) headParas.push(`<p>DOI: <a href="https://doi.org/${this.escape(meta.doi)}">https://doi.org/${this.escape(meta.doi)}</a></p>`);
+		let head = headParas.join("\n");
+		let headBlocks = headParas.length; // noteParser가 세는 leaf 블록 수(모두 <p>)
 		const progressLine = (msg) => `<p><em>⏳ ${this.escape(msg)}</em></p>`;
 		let note = new Zotero.Item("note");
 		note.libraryID = parent.libraryID;
@@ -455,10 +555,11 @@ var HighlightMirror = {
 		const flush = async (finalMsg) => {
 			// 연속으로 완료된 구간을 순서대로 노트에 덧붙인다
 			while (nextToAppend < chunks.length && results[nextToAppend] !== undefined) {
-				for (let t of results[nextToAppend] || []) {
-					let tag = t.kind === "heading" ? "h2" : "p";
-					body.push(`<${tag}>${this.escape(t.ko)}</${tag}>`);
-					map.push({ page: t.page, src: t.src, koHash: this.hash(this.noteParser.normalize(t.ko)) });
+				for (let b of results[nextToAppend] || []) {
+					let r = this.renderBlock(b);
+					if (!r) continue;
+					body.push(r.html);
+					for (let leaf of r.leaves) map.push({ page: b.page, src: b.src, koHash: this.hash(this.noteParser.normalize(leaf)) });
 				}
 				nextToAppend++;
 			}
@@ -467,7 +568,7 @@ var HighlightMirror = {
 				: progressLine(`번역 중… ${done}/${chunks.length} 구간 완료`);
 			note.setNote([head, ...body, tail].filter(Boolean).join("\n"));
 			await note.saveTx();
-			await this.state.saveMapping(note, { pdfKey: pdf.key, paragraphs: map, complete: finalMsg !== undefined });
+			await this.state.saveMapping(note, { pdfKey: pdf.key, headBlocks, paragraphs: map, complete: finalMsg !== undefined });
 		};
 
 		// 2) 구간 2개씩 동시에 번역, 완료되는 대로 순서 맞춰 추가
@@ -481,8 +582,8 @@ var HighlightMirror = {
 				catch (e) {
 					this.log(`translate chunk ${i + 1} failed: ${e}`);
 					failed.push(i + 1);
-					results[i] = [{ page: chunks[i][0].page, kind: "para", src: chunks[i][0].text.split(/\s+/).slice(0, 12).join(" "),
-						ko: `[구간 ${i + 1} 번역 실패: ${e.message || e}]` }];
+					results[i] = [{ type: "p", page: chunks[i][0].page, src: chunks[i][0].text.split(/\s+/).slice(0, 12).join(" "),
+						text: `[구간 ${i + 1} 번역 실패: ${e.message || e}]` }];
 				}
 				done++;
 				line.setProgress(Math.round((done / chunks.length) * 100));
@@ -496,7 +597,7 @@ var HighlightMirror = {
 		await flush(summary);
 		line.setProgress(100);
 		pw.startCloseTimer(2000);
-		this.notify("번역 노트 완성", `${map.length}개 단락${failed.length ? `, 실패 ${failed.length}구간` : ""}, 원문 대응표 저장됨`);
+		this.notify("번역 노트 완성", `${body.length}개 블록${failed.length ? `, 실패 ${failed.length}구간` : ""}, 원문 대응표 저장됨`);
 	},
 
 	escape(s) {
@@ -512,7 +613,7 @@ var HighlightMirror = {
 
 	// =================================================================== noteParser
 	noteParser: {
-		BLOCKS: new Set(["P", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "DIV", "TD", "PRE"]),
+		BLOCKS: new Set(["P", "LI", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "DIV", "TD", "TH", "PRE"]),
 
 		normalize(s) {
 			return String(s).replace(/\s+/g, " ").trim();
@@ -562,11 +663,11 @@ var HighlightMirror = {
 			let DOMParser = HighlightMirror.win().DOMParser;
 			let doc = new DOMParser().parseFromString(html, "text/html");
 			let out = [];
-			let blocks = [...doc.body.querySelectorAll("p, li, h1, h2, h3, h4, h5, h6, blockquote, td, pre")];
+			let blocks = [...doc.body.querySelectorAll("p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, pre")];
 			if (!blocks.length) blocks = [doc.body];
 			let blockIndex = 0;
 			for (let block of blocks) {
-				if (block.querySelector("p, li, h1, h2, h3, h4, h5, h6, blockquote, td, pre")) continue; // 중첩 블록은 자식에서 처리
+				if (block.querySelector("p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, pre")) continue; // 중첩 블록은 자식에서 처리
 				let run = null;
 				const flush = () => {
 					if (run && this.normalize(run.text).length >= 2) {
@@ -997,36 +1098,52 @@ var HighlightMirror = {
 		hintFor(h, mapping) {
 			if (!mapping || !mapping.paragraphs) return null;
 			// 번역 노트의 단락 해시가 아니라 포함 관계로 찾는 건 비용이 커서, 블록 순서 기반 근사
-			let p = mapping.paragraphs[h.block - 2]; // h1 + 안내문 두 블록 뒤부터 본문
+			let p = mapping.paragraphs[h.block - (mapping.headBlocks ?? 2)]; // 머리 블록 뒤부터 본문
 			return p ? `page ${p.page}, paragraph starting "${p.src}"` : null;
 		},
 
 		/**
-		 * 단락 묶음을 번역. 각 단락마다 원문 첫 단어들(src)을 돌려받아 대응표에 쓴다.
-		 * @returns {Array<{page, kind, src, ko}>}
+		 * 단락 묶음을 번역해 구조 블록 배열로 돌려준다(제목/단락/목록/인용/표/그림).
+		 * 각 블록에는 원문 첫 단어들(src)과 페이지를 붙여 대응표에 쓴다.
+		 * @returns {Array<{type, page, src, text?, items?, caption?, header?, rows?, note?}>}
 		 */
 		async translateChunk(paras, { lang, title }) {
-			let numbered = paras.map((p, i) => `[${i + 1}] (page ${p.page}, ${p.kind}) ${p.text}`).join("\n\n");
+			let numbered = paras.map((p, i) => `[${i + 1}] (page ${p.page}) ${p.text}`).join("\n\n");
 			let system = [
-				`You are translating an academic paper into ${lang} for a researcher's private study notes.`,
-				"Context: the researcher legally holds this paper and reads it through a translation stored only inside their own Zotero library. This is personal, non-distributed research use; a faithful full translation is required so that each translated paragraph can later be mapped back to the original passage.",
+				`You are translating an academic paper into ${lang} for a researcher's private study notes, producing a well-structured document (as a careful human translator would), not a flat dump of sentences.`,
+				"Context: the researcher legally holds this paper and reads it through a translation stored only inside their own Zotero library. This is personal, non-distributed research use; a faithful full translation is required so that each translated block can later be mapped back to the original passage.",
+				"",
+				"INPUT: numbered text fragments extracted from the PDF in reading order. Extraction is imperfect: a table may arrive as scattered cell fragments, a heading may be glued to the paragraph after it, several short fragments may be one list, and figure captions or bibliography entries appear as plain text.",
+				"",
+				"OUTPUT: ONLY a JSON array of blocks in reading order that together cover every fragment. Each block has \"ids\" (the fragment numbers it was built from, in order) and \"type\":",
+				`- {"type":"h1","text"}  the paper title (translated) and top-level section headings. Write section headings as "1. 서론(Introduction)": number, ${lang} heading, then the original English in parentheses.`,
+				`- {"type":"h2","text"} / {"type":"h3","text"}  subsection headings, e.g. "4.1. TCCM 프레임워크". The abstract heading is h2 "초록(Abstract)".`,
+				`- {"type":"p","text"}  one paragraph, translated completely and faithfully into ${lang}; never summarize, omit, or add commentary. A keywords line becomes "주요어: …". The author line and affiliations stay as a short paragraph.`,
+				`- {"type":"ul"|"ol","items":[...]}  when the source enumerates items (bulleted, numbered, "(1) … (2) …", or a run of short parallel fragments). A sentence that enumerates three or more parallel named items or questions (e.g. who/when/where/how…, the three "A"s, selection criteria) is also rendered as a list, with the introducing sentence as the preceding paragraph. Use "ol" when the order or numbering matters.`,
+				`- {"type":"quote","text"}  a set-off direct quotation (block quote). Inline quotations stay inside the paragraph with their quotation marks.`,
+				`- {"type":"table","caption":"표 N. …","header":[...],"rows":[[...],...],"note":"…"}  rebuild a real table from the cell fragments: translate cell text, keep names/numbers/journal titles verbatim, one array per row with the same column count as the header. If some cells are too garbled to recover, rebuild what is reliable and say what was abridged in "note" (optional).`,
+				`- {"type":"figure","caption":"그림 N. …","items":[...]}  a figure: translate the caption and list in "items" the figure's content that is visible in the text (box labels, steps, arrows). If nothing beyond the caption is available, give only the caption.`,
+				`- {"type":"skip"}  for text not worth keeping: running headers/footers, page numbers, "To cite this article", submission/acceptance dates, copyright or licence lines, and individual bibliography entries.`,
+				"",
 				"Rules:",
-				`- Translate each numbered paragraph completely and faithfully into ${lang}; do not summarize, omit, or add commentary.`,
-				"- Keep author names, citations (e.g. Paul & Benito, 2018), acronyms, framework names, and numbers exactly as in the source; on first use, put the original English term in parentheses after a translated key term.",
-				"- Headings stay headings (short).",
-				"- Return ONLY a JSON array with one object per input paragraph, in order:",
-				"  [{\"id\": 1, \"src\": \"<first 10 words of the ORIGINAL paragraph, verbatim>\", \"ko\": \"<translation>\"}, ...]",
+				"- Keep author names, in-text citations (e.g. Paul & Benito, 2018), acronyms, framework names, variable names and numbers exactly as in the source.",
+				`- On the first use of a key technical term, put the original English in parentheses after the ${lang} term, e.g. 체계적 문헌고찰(systematic literature review).`,
+				"- Use **double asterisks** to bold a term that is bolded or being defined in the source (e.g. **이론(Theory)**은 …).",
+				"- Reference list: when the bibliography begins, emit its heading as h1 \"참고문헌(References)\" followed by ONE paragraph: \"원문의 참고문헌 목록은 서지정보의 정확성을 위해 번역하지 않고 원문 표기를 유지한다.\" — then skip every entry. If the fragments are all bibliography entries (the list began in an earlier chunk), skip them all.",
+				"- Author biographies, acknowledgements and disclosure statements are translated as normal sections.",
+				"- Never output anything before or after the JSON array. Escape quotes inside strings. No HTML or Markdown other than ** for bold.",
 			].join("\n");
 			let user = `Paper: ${title}\n\n${numbered}`;
 			let { text, usage } = await this.request({ system, user, maxTokens: 24000 });
 			HighlightMirror.log(`translate usage: ${JSON.stringify(usage)}`);
 			let arr = this.parseJSONArray(text);
 			let out = [];
-			for (let r of arr) {
-				let p = paras[(r.id | 0) - 1];
-				if (!p || !r.ko) continue;
-				let src = String(r.src || p.text).split(/\s+/).slice(0, 12).join(" ");
-				out.push({ page: p.page, kind: p.kind, src, ko: String(r.ko) });
+			for (let b of arr) {
+				if (!b || typeof b !== "object") continue;
+				let ids = (Array.isArray(b.ids) ? b.ids : [b.id]).map(x => (x | 0) - 1).filter(i => i >= 0 && i < paras.length);
+				let p = paras[ids.length ? ids[0] : 0];
+				let src = (ids.length ? ids.map(i => paras[i].text).join(" ") : String(b.text || "")).split(/\s+/).slice(0, 12).join(" ");
+				out.push(Object.assign({}, b, { type: String(b.type || "p"), page: p.page, src }));
 			}
 			return out;
 		},
@@ -1220,7 +1337,9 @@ var HighlightMirror = {
 				if (!note.isNote()) throw new Error("item is not a note");
 				let html = note.getNote();
 				return { key: note.key, length: html.length, paragraphs: (html.match(/<p>/g) || []).length,
-					headings: (html.match(/<h2>/g) || []).length, tail: html.slice(-300) };
+					headings: (html.match(/<h[123]>/g) || []).length, tables: (html.match(/<table>/g) || []).length,
+					lists: (html.match(/<[uo]l>/g) || []).length, quotes: (html.match(/<blockquote>/g) || []).length,
+					tail: html.slice(-300), html: p.full ? html : undefined };
 			},
 
 			async item(p) {
