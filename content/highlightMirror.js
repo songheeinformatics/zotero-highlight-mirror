@@ -257,6 +257,7 @@ var HighlightMirror = {
 
 	async syncSelected(window) {
 		let items = window.ZoteroPane.getSelectedItems();
+		this.log(`menu: sync clicked, ${items.length} item(s) selected`);
 		let notes = this._collectNotes(items);
 		if (!notes.length) {
 			this.notify("대상 없음", "하위 노트가 있는 아이템이나 노트를 선택하세요.");
@@ -275,12 +276,21 @@ var HighlightMirror = {
 
 	async translateSelected(window) {
 		let items = window.ZoteroPane.getSelectedItems();
+		this.log(`menu: translate clicked, ${items.length} item(s) selected`);
 		let parents = new Set();
 		for (let item of items) {
 			if (item.isRegularItem()) parents.add(item);
 			else if (item.parentItemID) parents.add(Zotero.Items.get(item.parentItemID));
 		}
+		if (!parents.size) {
+			this.notify("대상 없음", "논문 아이템(또는 그 PDF/노트)을 선택한 뒤 실행하세요.");
+			return;
+		}
 		for (let parent of parents) {
+			if (this.hasTranslationNote(parent)) {
+				let again = window.confirm(`"${parent.getField("title").slice(0, 60)}"에는 이미 번역 노트가 있습니다. 새로 하나 더 만들까요?`);
+				if (!again) continue;
+			}
 			try {
 				await this.translateItem(parent);
 			}
@@ -412,45 +422,81 @@ var HighlightMirror = {
 			this.notify("PDF 없음", "선택한 아이템에 PDF 첨부가 없습니다.");
 			return;
 		}
-		pages = pages || await this.pdfText.getPages(pdf);
-		let paragraphs = this.pdfText.toParagraphs(pages);
 		let lang = this.pref("targetLang") || "한국어";
 		let title = parent.getField("title");
+
+		// 1) 노트를 먼저 만들어 바로 보이게 하고, 구간이 끝날 때마다 단락을 덧붙인다
+		let head = `<h1>[${lang} 번역] ${this.escape(title)}</h1>\n`
+			+ `<p><em>Highlight Mirror가 Claude API로 만든 개인 연구용 번역입니다. 하이라이트하면 원문 PDF에 같은 자리로 주석이 달립니다.</em></p>`;
+		const progressLine = (msg) => `<p><em>⏳ ${this.escape(msg)}</em></p>`;
+		let note = new Zotero.Item("note");
+		note.libraryID = parent.libraryID;
+		note.parentID = parent.id;
+		note.setNote(head + "\n" + progressLine("원문 PDF 텍스트를 읽는 중…"));
+		note.addTag(this.TAG);
+		await note.saveTx();
+
+		pages = pages || await this.pdfText.getPages(pdf);
+		let paragraphs = this.pdfText.toParagraphs(pages);
+		let chunks = this.pdfText.chunkParagraphs(paragraphs, 3500);
 
 		let pw = new Zotero.ProgressWindow({ closeOnClick: false });
 		pw.changeHeadline("Highlight Mirror: 번역 중");
 		let line = new pw.ItemProgress(null, `${title}`);
 		pw.show();
 
-		let chunks = this.pdfText.chunkParagraphs(paragraphs, 7000);
-		let translated = [];
-		for (let i = 0; i < chunks.length; i++) {
-			line.setProgress(Math.round((i / chunks.length) * 100));
-			line.setText(`${i + 1}/${chunks.length} 구간 번역 중… (${title.slice(0, 40)})`);
-			let part = await this.claude.translateChunk(chunks[i], { lang, title });
-			translated.push(...part);
-		}
+		let body = [];   // 완성된 단락 HTML (순서대로)
+		let map = [];
+		let results = new Array(chunks.length);
+		let nextToAppend = 0;
+		let done = 0;
+		let failed = [];
+
+		const flush = async (finalMsg) => {
+			// 연속으로 완료된 구간을 순서대로 노트에 덧붙인다
+			while (nextToAppend < chunks.length && results[nextToAppend] !== undefined) {
+				for (let t of results[nextToAppend] || []) {
+					let tag = t.kind === "heading" ? "h2" : "p";
+					body.push(`<${tag}>${this.escape(t.ko)}</${tag}>`);
+					map.push({ page: t.page, src: t.src, koHash: this.hash(this.noteParser.normalize(t.ko)) });
+				}
+				nextToAppend++;
+			}
+			let tail = finalMsg !== undefined
+				? (finalMsg ? progressLine(finalMsg) : "")
+				: progressLine(`번역 중… ${done}/${chunks.length} 구간 완료`);
+			note.setNote([head, ...body, tail].filter(Boolean).join("\n"));
+			await note.saveTx();
+			await this.state.saveMapping(note, { pdfKey: pdf.key, paragraphs: map, complete: finalMsg !== undefined });
+		};
+
+		// 2) 구간 2개씩 동시에 번역, 완료되는 대로 순서 맞춰 추가
+		let cursor = 0;
+		const worker = async () => {
+			while (cursor < chunks.length) {
+				let i = cursor++;
+				try {
+					results[i] = await this.claude.translateChunk(chunks[i], { lang, title });
+				}
+				catch (e) {
+					this.log(`translate chunk ${i + 1} failed: ${e}`);
+					failed.push(i + 1);
+					results[i] = [{ page: chunks[i][0].page, kind: "para", src: chunks[i][0].text.split(/\s+/).slice(0, 12).join(" "),
+						ko: `[구간 ${i + 1} 번역 실패: ${e.message || e}]` }];
+				}
+				done++;
+				line.setProgress(Math.round((done / chunks.length) * 100));
+				line.setText(`${done}/${chunks.length} 구간 완료 (${title.slice(0, 40)})`);
+				await flush();
+			}
+		};
+		await Promise.all([worker(), worker()]);
+
+		let summary = failed.length ? `구간 ${failed.join(", ")} 번역 실패. 우클릭 메뉴로 다시 시도하세요.` : "";
+		await flush(summary);
 		line.setProgress(100);
 		pw.startCloseTimer(2000);
-
-		// 노트 HTML + 대응표
-		let html = [`<h1>[${lang} 번역] ${this.escape(title)}</h1>`];
-		html.push(`<p><em>Highlight Mirror가 Claude API로 만든 개인 연구용 번역입니다. 하이라이트하면 원문 PDF에 같은 자리로 주석이 달립니다.</em></p>`);
-		let map = [];
-		for (let t of translated) {
-			let tag = t.kind === "heading" ? "h2" : "p";
-			html.push(`<${tag}>${this.escape(t.ko)}</${tag}>`);
-			map.push({ page: t.page, src: t.src, koHash: this.hash(this.noteParser.normalize(t.ko)) });
-		}
-
-		let note = new Zotero.Item("note");
-		note.libraryID = parent.libraryID;
-		note.parentID = parent.id;
-		note.setNote(html.join("\n"));
-		note.addTag(this.TAG);
-		await note.saveTx();
-		await this.state.saveMapping(note, { pdfKey: pdf.key, paragraphs: map });
-		this.notify("번역 노트 생성", `${translated.length}개 단락, 원문 대응표 저장됨`);
+		this.notify("번역 노트 완성", `${map.length}개 단락${failed.length ? `, 실패 ${failed.length}구간` : ""}, 원문 대응표 저장됨`);
 	},
 
 	escape(s) {
@@ -1076,7 +1122,7 @@ var HighlightMirror = {
 	 */
 	server: {
 		PATHS: ["/highlight-mirror/status", "/highlight-mirror/locate", "/highlight-mirror/highlights",
-			"/highlight-mirror/sync", "/highlight-mirror/translate"],
+			"/highlight-mirror/sync", "/highlight-mirror/translate", "/highlight-mirror/note", "/highlight-mirror/item"],
 
 		register() {
 			if (!Zotero.Server || !Zotero.Server.Endpoints) return;
@@ -1130,10 +1176,16 @@ var HighlightMirror = {
 				catch (e) {
 					pdfjs = { ok: false, error: String(e.message || e) };
 				}
+				let menus = Zotero.getMainWindows().map(w => ({
+					sync: !!w.document.getElementById("hm-menu-sync"),
+					translate: !!w.document.getElementById("hm-menu-translate"),
+					itemmenu: !!w.document.getElementById("zotero-itemmenu"),
+				}));
 				return {
 					plugin: "highlight-mirror",
 					version: HM.version,
 					zotero: Zotero.version,
+					windows: menus,
 					model: HM.pref("model"),
 					hasApiKey: !!(HM.pref("apiKey") || "").trim(),
 					autoSync: HM.pref("autoSync"),
@@ -1161,6 +1213,22 @@ var HighlightMirror = {
 				let note = HighlightMirror.server.byKey(p.note);
 				if (!note.isNote()) throw new Error("item is not a note");
 				return HighlightMirror.noteParser.extract(note.getNote());
+			},
+
+			async note(p) {
+				let note = HighlightMirror.server.byKey(p.note);
+				if (!note.isNote()) throw new Error("item is not a note");
+				let html = note.getNote();
+				return { key: note.key, length: html.length, paragraphs: (html.match(/<p>/g) || []).length,
+					headings: (html.match(/<h2>/g) || []).length, tail: html.slice(-300) };
+			},
+
+			async item(p) {
+				let item = HighlightMirror.server.byKey(p.item);
+				let notes = Zotero.Items.get(item.getNotes ? item.getNotes() : []);
+				let pdf = item.isRegularItem() ? await HighlightMirror.findPDF(item) : null;
+				return { key: item.key, title: item.getField("title"), pdf: pdf && pdf.key,
+					notes: notes.map(n => ({ key: n.key, tags: n.getTags().map(t => t.tag), length: n.getNote().length })) };
 			},
 
 			async sync(p) {
