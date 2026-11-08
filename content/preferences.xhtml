@@ -27,8 +27,9 @@
 
   <groupbox>
     <label><html:h2 style="margin:4px 0">하이라이트 미러링</html:h2></label>
-    <checkbox label="번역 노트가 바뀌면 자동으로 PDF 하이라이트 갱신"
-              preference="extensions.highlightmirror.autoSync" native="true"/>
+    <html:p style="margin:2px 0 8px; color: var(--fill-secondary);">
+      노트를 다 읽은 뒤 우클릭 → "노트 하이라이트 → PDF 주석"을 누를 때만 원문 PDF에 반영합니다. (아이템 목록 우클릭, 또는 PDF 화면 우클릭)
+    </html:p>
     <checkbox label="노트 하이라이트 색을 PDF 주석에 그대로 사용"
               preference="extensions.highlightmirror.useNoteColor" native="true"/>
     <hbox align="center" style="gap:8px; margin-top:4px">

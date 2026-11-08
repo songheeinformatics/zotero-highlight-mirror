@@ -1,7 +1,5 @@
 pref("extensions.highlightmirror.apiKey", "");
 pref("extensions.highlightmirror.model", "claude-opus-5-5");
-pref("extensions.highlightmirror.autoSync", true);
-pref("extensions.highlightmirror.debounceMs", 4000);
 pref("extensions.highlightmirror.color", "#ffd400");
 pref("extensions.highlightmirror.useNoteColor", true);
 pref("extensions.highlightmirror.commentMode", "translation");

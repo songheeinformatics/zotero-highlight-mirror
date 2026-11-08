@@ -6,7 +6,7 @@
  *
  * 1) 번역 노트의 하이라이트  →  원문 PDF 하이라이트 주석 (댓글 = 번역문)
  * 2) 원문 PDF  →  Claude API로 단락 단위 번역 노트 + 원문 대응표
- * 3) 노트가 바뀌면(Notifier) 새로 생긴 하이라이트만 자동 미러링
+ * 3) 노트 → PDF 반영은 우클릭 메뉴로만 (노트를 고칠 때마다 자동 반영하지 않음 — 읽는 중 리더가 튀는 문제)
  *
  * 모듈 구성: noteParser / pdfText / matcher / claude / annotator / state / ui / prefs
  */
@@ -61,6 +61,7 @@ var HighlightMirror = {
 			this.notifier, ["item"], "highlightMirror");
 		await this.state.ensureDir();
 		this.server.register();
+		this.registerReaderMenu();
 	},
 
 	shutdown() {
@@ -68,6 +69,7 @@ var HighlightMirror = {
 			Zotero.Notifier.unregisterObserver(this._notifierID);
 		}
 		this.server.unregister();
+		this.unregisterReaderMenu();
 		for (let t of this._timers.values()) {
 			this.win().clearTimeout(t);
 		}
@@ -96,12 +98,9 @@ var HighlightMirror = {
 			for (let id of ids) {
 				let item = Zotero.Items.get(id);
 				if (!item) continue;
-				// 번역 노트의 하이라이트 → PDF 주석
-				if (item.isNote() && item.parentItemID && HM.pref("autoSync")) {
-					if (item.getNote().indexOf("background-color") !== -1) HM.scheduleSync(item.id);
-				}
+				// 노트 하이라이트 → PDF 주석은 자동으로 하지 않는다(우클릭 메뉴로만).
 				// 새 PDF 첨부 → 번역 노트
-				else if (event === "add" && item.isAttachment() && item.parentItemID && HM.pref("autoTranslate")) {
+				if (event === "add" && item.isAttachment() && item.parentItemID && HM.pref("autoTranslate")) {
 					if (item.isPDFAttachment()) HM.scheduleTranslate(item.id);
 				}
 			}
@@ -179,25 +178,6 @@ var HighlightMirror = {
 		return (text.match(re) || []).length / letters > 0.2;
 	},
 
-	scheduleSync(noteID) {
-		let win = this.win();
-		if (this._timers.has(noteID)) {
-			win.clearTimeout(this._timers.get(noteID));
-		}
-		let delay = Number(this.pref("debounceMs")) || 4000;
-		this._timers.set(noteID, win.setTimeout(async () => {
-			this._timers.delete(noteID);
-			let note = Zotero.Items.get(noteID);
-			if (!note) return;
-			try {
-				await this.syncNote(note, { manual: false });
-			}
-			catch (e) {
-				this.log(`autoSync failed: ${e}`);
-			}
-		}, delay));
-	},
-
 	// ------------------------------------------------------------------- UI
 	addToWindow(window) {
 		let doc = window.document;
@@ -220,6 +200,50 @@ var HighlightMirror = {
 
 		menu.append(sep, sync, translate);
 		this._windows.add(window);
+	},
+
+	/** PDF 리더 화면 우클릭 메뉴: 이 논문의 노트 하이라이트를 지금 PDF에 반영 */
+	registerReaderMenu() {
+		if (this._readerHandler || !Zotero.Reader?.registerEventListener) return;
+		this._readerHandler = ({ reader, append }) => {
+			append({
+				label: "노트 하이라이트 → PDF 주석 (Highlight Mirror)",
+				onCommand: () => this.syncForReader(reader),
+			});
+		};
+		Zotero.Reader.registerEventListener("createViewContextMenu", this._readerHandler, this.id);
+	},
+
+	unregisterReaderMenu() {
+		if (!this._readerHandler) return;
+		try {
+			Zotero.Reader.unregisterEventListener("createViewContextMenu", this._readerHandler);
+		}
+		catch (e) { /* 이미 해제됨 */ }
+		this._readerHandler = null;
+	},
+
+	async syncForReader(reader) {
+		let att = Zotero.Items.get(reader.itemID);
+		if (!att || !att.parentItemID) {
+			this.notify("대상 없음", "상위 아이템이 있는 PDF에서만 쓸 수 있습니다.");
+			return;
+		}
+		let notes = this._collectNotes([att]);
+		if (!notes.length) {
+			this.notify("대상 없음", "이 논문에 노트가 없습니다.");
+			return;
+		}
+		for (let note of notes) {
+			try {
+				await this.syncNote(note, { manual: true });
+			}
+			catch (e) {
+				this.log(`sync error: ${e}
+${e.stack || ""}`);
+				this.notify("오류", String(e.message || e), 10000);
+			}
+		}
 	},
 
 	removeFromWindow(window) {
@@ -1305,7 +1329,8 @@ var HighlightMirror = {
 					windows: menus,
 					model: HM.pref("model"),
 					hasApiKey: !!(HM.pref("apiKey") || "").trim(),
-					autoSync: HM.pref("autoSync"),
+					autoSync: false,
+					readerMenu: !!HM._readerHandler,
 					stateDir: HM.state.dir(),
 					pdfjs,
 				};
