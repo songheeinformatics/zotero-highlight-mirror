@@ -7,3 +7,5 @@ pref("extensions.highlightmirror.removeOrphans", false);
 pref("extensions.highlightmirror.targetLang", "한국어");
 pref("extensions.highlightmirror.autoTranslate", true);
 pref("extensions.highlightmirror.maxPages", 60);
+pref("extensions.highlightmirror.polish", true);
+pref("extensions.highlightmirror.polishModel", "claude-sonnet-5-5");

@@ -198,7 +198,12 @@ var HighlightMirror = {
 		translate.setAttribute("label", "원문 PDF → 번역 노트 (Claude)");
 		translate.addEventListener("command", () => this.translateSelected(window));
 
-		menu.append(sep, sync, translate);
+		let polish = doc.createXULElement("menuitem");
+		polish.id = "hm-menu-polish";
+		polish.setAttribute("label", "번역 노트 다듬기 — 문단 나누기·핵심 볼드 (Claude)");
+		polish.addEventListener("command", () => this.polishSelected(window));
+
+		menu.append(sep, sync, translate, polish);
 		this._windows.add(window);
 	},
 
@@ -248,7 +253,7 @@ ${e.stack || ""}`);
 
 	removeFromWindow(window) {
 		let doc = window.document;
-		for (let id of ["hm-menu-sep", "hm-menu-sync", "hm-menu-translate"]) {
+		for (let id of ["hm-menu-sep", "hm-menu-sync", "hm-menu-translate", "hm-menu-polish"]) {
 			let el = doc.getElementById(id);
 			if (el) el.remove();
 		}
@@ -601,7 +606,12 @@ ${e.stack || ""}`);
 			while (cursor < chunks.length) {
 				let i = cursor++;
 				try {
-					results[i] = await this.claude.translateChunk(chunks[i], { lang, title });
+					let blocks = await this.claude.translateChunk(chunks[i], { lang, title });
+					if (this.pref("polish")) {
+						try { blocks = await this.polishBlocks(blocks); }
+						catch (e) { this.log(`polish chunk ${i + 1} failed, keeping raw translation: ${e}`); }
+					}
+					results[i] = blocks;
 				}
 				catch (e) {
 					this.log(`translate chunk ${i + 1} failed: ${e}`);
@@ -622,6 +632,181 @@ ${e.stack || ""}`);
 		line.setProgress(100);
 		pw.startCloseTimer(2000);
 		this.notify("번역 노트 완성", `${body.length}개 블록${failed.length ? `, 실패 ${failed.length}구간` : ""}, 원문 대응표 저장됨`);
+	},
+
+	// ------------------------------------------- 3) 2차 편집 패스(문단 나누기·핵심 볼드)
+	/**
+	 * 편집 패스 결과 검증. ** 와 공백을 빼고 이어 붙인 글자가 원래 단락과 정확히 같을 때만 받아들인다.
+	 * 문장 중간에서 끊긴 조각은 다음 조각과 다시 합치고, 짝이 안 맞는 ** 는 그 조각에서 지운다.
+	 * @returns {string[]|null} 바뀐 것이 없거나 검증 실패면 null
+	 */
+	polishCheck(orig, parts) {
+		const bare = (s) => String(s).replace(/\*\*/g, "").replace(/\s+/g, "");
+		if (!Array.isArray(parts)) return null;
+		parts = parts.map(p => String(p ?? "").trim()).filter(Boolean);
+		if (!parts.length || bare(parts.join("")) !== bare(orig)) return null;
+		parts = parts.map(p => ((p.match(/\*\*/g) || []).length % 2 ? p.replace(/\*\*/g, "") : p));
+		let merged = [];
+		for (let p of parts) {
+			let prev = merged[merged.length - 1];
+			let prevEnd = prev && prev.replace(/\*\*/g, "").trim();
+			if (prev && !/[.?!…。"”’'」』)\]]$/.test(prevEnd)) merged[merged.length - 1] = prev + " " + p;
+			else merged.push(p);
+		}
+		if (merged.length === 1 && merged[0] === String(orig).trim()) return null;
+		return merged;
+	},
+
+	/** 편집 대상 단락으로 볼 만한가: 너무 짧거나 정형 문구는 건드리지 않는다. */
+	polishable(text) {
+		let t = String(text ?? "");
+		return t.length >= 60 && !/^주요어:|^원문의 참고문헌 목록은|^\[구간 \d+ 번역 실패/.test(t);
+	},
+
+	/** 단락 묶음을 약 6,000자 배치로 나눠 편집 패스를 돌린다(2개 동시). */
+	async polishTexts(texts) {
+		let batches = [];
+		let cur = [];
+		let len = 0;
+		texts.forEach((t, i) => {
+			if (len + t.length > 6000 && cur.length) { batches.push(cur); cur = []; len = 0; }
+			cur.push(i);
+			len += t.length;
+		});
+		if (cur.length) batches.push(cur);
+		let out = new Array(texts.length).fill(null);
+		let next = 0;
+		const worker = async () => {
+			while (next < batches.length) {
+				let b = batches[next++];
+				try {
+					let res = await this.claude.polishParagraphs(b.map(i => texts[i]));
+					b.forEach((i, k) => { out[i] = res[k]; });
+				}
+				catch (e) {
+					this.log(`polish batch failed: ${e}`);
+				}
+			}
+		};
+		await Promise.all([worker(), worker()]);
+		return out;
+	},
+
+	/**
+	 * 새 번역 구간의 블록에 편집 패스를 적용한다. 나뉜 단락은 원래 블록의 page/src를 물려받아
+	 * 대응표(하이라이트 → 원문 힌트)가 그대로 맞는다. 실패하면 1차 번역을 그대로 둔다.
+	 */
+	async polishBlocks(blocks) {
+		let idx = [];
+		blocks.forEach((b, i) => { if (b && b.type === "p" && this.polishable(b.text)) idx.push(i); });
+		if (!idx.length) return blocks;
+		let res = await this.polishTexts(idx.map(i => blocks[i].text));
+		let out = [];
+		let pos = new Map(idx.map((i, k) => [i, k]));
+		blocks.forEach((b, i) => {
+			let parts = pos.has(i) ? res[pos.get(i)] : null;
+			if (parts) for (let t of parts) out.push(Object.assign({}, b, { text: t }));
+			else out.push(b);
+		});
+		let changed = res.filter(Boolean).length;
+		this.log(`polish: ${changed}/${idx.length} paragraphs reformatted`);
+		return out;
+	},
+
+	/**
+	 * 이미 있는 번역 노트를 다듬는다. 하이라이트·링크 등 다른 서식이 있는 단락은 건드리지 않고,
+	 * 덮어쓰기 전에 원래 HTML을 상태 폴더에 백업한다.
+	 */
+	async polishNote(note) {
+		let html = note.getNote();
+		let doc = new (this.win().DOMParser)().parseFromString(html, "text/html");
+		const LEAF = "p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, pre";
+		let leaves = [...doc.body.querySelectorAll(LEAF)].filter(el => !el.querySelector(LEAF));
+		let mapping = await this.state.loadMapping(note);
+		let headBlocks = mapping?.headBlocks ?? 2;
+
+		let cands = [];
+		leaves.forEach((el, leafIndex) => {
+			if (leafIndex < headBlocks || el.tagName !== "P" || el.closest("li, td, th, blockquote")) return;
+			let clone = el.cloneNode(true);
+			for (let s of [...clone.querySelectorAll("strong, b")]) {
+				if (s.querySelector("*")) return;
+				s.replaceWith(doc.createTextNode(`**${s.textContent}**`));
+			}
+			if (clone.querySelector("*")) return; // 하이라이트 span·링크·기울임 등이 남아 있으면 건너뜀
+			let text = clone.textContent.replace(/\s+/g, " ").trim();
+			if (this.polishable(text)) cands.push({ el, leafIndex, text });
+		});
+		if (!cands.length) return { paragraphs: 0, changed: 0 };
+
+		let res = await this.polishTexts(cands.map(c => c.text));
+		let splits = new Map();
+		cands.forEach((c, k) => {
+			let parts = res[k];
+			if (!parts) return;
+			let frag = doc.createDocumentFragment();
+			parts.forEach((t, j) => {
+				let p = doc.createElement("p");
+				p.innerHTML = this.inline(t);
+				if (j) frag.append(doc.createTextNode("\n"));
+				frag.append(p);
+			});
+			c.el.replaceWith(frag);
+			splits.set(c.leafIndex, parts.length);
+		});
+		let changed = splits.size;
+		if (!changed) return { paragraphs: cands.length, changed: 0 };
+
+		await this.state.ensureDir();
+		let stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		let backup = this.paths.join(this.state.dir(), `backup-${note.libraryID}-${note.key}-${stamp}.html`);
+		await this.io.writeUTF8(backup, html);
+
+		if (mapping && Array.isArray(mapping.paragraphs)) {
+			let paras = [];
+			mapping.paragraphs.forEach((entry, j) => {
+				let k = splits.get(j + headBlocks) || 1;
+				for (let n = 0; n < k; n++) paras.push(entry);
+			});
+			mapping.paragraphs = paras;
+			mapping.polished = new Date().toISOString();
+			await this.state.saveMapping(note, mapping);
+		}
+		note.setNote(doc.body.innerHTML);
+		await note.saveTx();
+		this.log(`polishNote ${note.key}: ${changed}/${cands.length} paragraphs, backup ${backup}`);
+		return { paragraphs: cands.length, changed, backup };
+	},
+
+	async polishSelected(window) {
+		let items = window.ZoteroPane.getSelectedItems();
+		let notes = this._collectNotes(items).filter(n => items.includes(n) || n.hasTag(this.TAG));
+		if (!notes.length) {
+			this.notify("대상 없음", "Highlight Mirror 번역 노트가 있는 아이템이나 노트를 선택하세요.");
+			return;
+		}
+		if (!(this.pref("apiKey") || "").trim()) {
+			this.notify("API 키 없음", "설정 → Highlight Mirror에서 Claude API 키를 입력하세요.");
+			return;
+		}
+		let pw = new Zotero.ProgressWindow({ closeOnClick: false });
+		pw.changeHeadline("Highlight Mirror: 번역 노트 다듬는 중");
+		let line = new pw.ItemProgress(null, `${notes.length}개 노트`);
+		pw.show();
+		let total = 0;
+		for (let [i, note] of notes.entries()) {
+			try {
+				let r = await this.polishNote(note);
+				total += r.changed;
+			}
+			catch (e) {
+				this.log(`polish error: ${e}\n${e.stack || ""}`);
+				this.notify("오류", String(e.message || e), 10000);
+			}
+			line.setProgress(Math.round(((i + 1) / notes.length) * 100));
+		}
+		line.setText(`${notes.length}개 노트, 단락 ${total}개 다듬음`);
+		pw.startCloseTimer(4000);
 	},
 
 	escape(s) {
@@ -1036,12 +1221,12 @@ ${e.stack || ""}`);
 			return /^claude-(opus-5|sonnet-5-5|fable)/.test(model);
 		},
 
-		async request({ system, user, maxTokens = 16000 }) {
+		async request({ system, user, maxTokens = 16000, model }) {
 			let apiKey = (HighlightMirror.pref("apiKey") || "").trim();
 			if (!apiKey) {
 				throw new Error("Claude API 키가 없습니다. 설정 → Highlight Mirror에서 입력하세요.");
 			}
-			let model = HighlightMirror.pref("model") || "claude-opus-5-5";
+			model = model || HighlightMirror.pref("model") || "claude-opus-5-5";
 			let headers = {
 				"Content-Type": "application/json",
 				"x-api-key": apiKey,
@@ -1172,6 +1357,52 @@ ${e.stack || ""}`);
 			return out;
 		},
 
+		/**
+		 * 2차 편집 패스: 이미 번역된 단락을 읽기 단위(1~3문장)로 나누고 핵심에 **볼드**를 단다.
+		 * 문장은 고치지 않는다. 결과는 polishCheck로 원문과 글자 단위로 대조해, 다르면 버린다.
+		 * @param {string[]} texts 번역 단락들
+		 * @returns {Promise<Array<string[]|null>>} 단락별 조각 배열(검증 실패·변화 없음은 null)
+		 */
+		async polishParagraphs(texts) {
+			if (!texts.length) return [];
+			let numbered = texts.map((t, i) => JSON.stringify({ id: i + 1, text: t })).join("\n");
+			let system = [
+				"You are a copy-editor formatting a Korean translation of an academic paper so a researcher can read it comfortably on screen in their private study notes. The translation is already final.",
+				"You receive numbered paragraphs as JSON lines. For each one, return the SAME text, character for character, with only two kinds of change:",
+				"",
+				"1. SPLIT into reading units: break a long paragraph into several shorter paragraphs of 1–3 sentences each (aim for 100–200 Korean characters; a unit longer than 250 characters that contains two or more sentences must be split again), at sentence boundaries where the thought moves on (a new claim, an example, a counterpoint, a list of studies, the conclusion of the paragraph). Never split inside a sentence or inside parentheses. A paragraph of one or two sentences stays whole.",
+				"2. BOLD with **double asterisks** what a reader skimming the page must catch:",
+				"   - the paper's central argument or thesis, and the key conclusion of a section (one sentence, or its core clause);",
+				"   - a key concept where it is introduced or defined (just the term, e.g. **관계(relation)**);",
+				"   - a key finding or number (e.g. **85%의 예측 정확도**);",
+				"   - labels of enumerated research questions, propositions or stages (e.g. **(a)**).",
+				"   Most reading units get zero or one bold; transitional or descriptive passages get none. Never bold several sentences together, citations, author names, or connectives. Keep any ** already present.",
+				"",
+				"Do NOT change, add, delete, reorder or re-translate any character. The only allowed edits are paragraph breaks and ** markers. If a paragraph needs nothing, return it as a single part.",
+				"Output ONLY a JSON array covering every id: [{\"id\":1,\"parts\":[\"…\",\"…\"]}, …]. Escape quotes inside strings.",
+			].join("\n");
+			let model = HighlightMirror.pref("polishModel") || "claude-sonnet-5-5";
+			let total = texts.reduce((n, t) => n + t.length, 0);
+			let { text, usage } = await this.request({ system, user: numbered, model, maxTokens: Math.min(32000, 4000 + total * 2) });
+			HighlightMirror.log(`polish usage: ${JSON.stringify(usage)}`);
+			let arr = this.parseJSONArray(text);
+			let out = new Array(texts.length).fill(null);
+			for (let r of arr) {
+				let i = (r?.id | 0) - 1;
+				if (i < 0 || i >= texts.length) continue;
+				out[i] = HighlightMirror.polishCheck(texts[i], r.parts);
+				if (!out[i] && Array.isArray(r.parts) && r.parts.length > 1) {
+					// 검증 탈락 이유를 짧게 남긴다(어느 글자에서 어긋났는지)
+					const bare = (s) => String(s).replace(/\*\*/g, "").replace(/\s+/g, "");
+					let x = bare(texts[i]), y = bare(r.parts.join(""));
+					let k = 0;
+					while (k < x.length && x[k] === y[k]) k++;
+					HighlightMirror.log(`polish reject #${i + 1}: ${x.length}/${y.length} chars, differs at ${k}: [${x.slice(Math.max(0, k - 8), k + 20)}] vs [${y.slice(Math.max(0, k - 8), k + 20)}]`);
+				}
+			}
+			return out;
+		},
+
 		async ping() {
 			let { text, model } = await this.request({ system: "Reply with the single word OK.", user: "ping", maxTokens: 16 });
 			return `${model}: ${text.trim()}`;
@@ -1260,10 +1491,12 @@ ${e.stack || ""}`);
 	 *   GET  /highlight-mirror/highlights?note=<note key>                 (노트에서 뽑은 하이라이트)
 	 *   POST /highlight-mirror/sync      {"note": "<note key>"}            (실제 주석 생성)
 	 *   POST /highlight-mirror/translate {"item": "<parent key>"}          (번역 노트 생성)
+	 *   POST /highlight-mirror/polish    {"note": "<note key>"}            (기존 번역 노트 다듬기)
 	 */
 	server: {
 		PATHS: ["/highlight-mirror/status", "/highlight-mirror/locate", "/highlight-mirror/highlights",
-			"/highlight-mirror/sync", "/highlight-mirror/translate", "/highlight-mirror/note", "/highlight-mirror/item"],
+			"/highlight-mirror/sync", "/highlight-mirror/translate", "/highlight-mirror/note", "/highlight-mirror/item",
+			"/highlight-mirror/polish"],
 
 		register() {
 			if (!Zotero.Server || !Zotero.Server.Endpoints) return;
@@ -1386,6 +1619,12 @@ ${e.stack || ""}`);
 				let parent = HighlightMirror.server.byKey(p.item);
 				await HighlightMirror.translateItem(parent);
 				return { ok: true, notes: parent.getNotes().length };
+			},
+
+			async polish(p) {
+				let note = HighlightMirror.server.byKey(p.note);
+				if (!note.isNote()) throw new Error("item is not a note");
+				return await HighlightMirror.polishNote(note);
 			},
 		},
 	},

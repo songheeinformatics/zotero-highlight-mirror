@@ -57,6 +57,21 @@
       <label value="자동 번역 최대 쪽수" style="margin-left: 12px"/>
       <html:input type="number" min="1" max="500" style="width: 5em" preference="extensions.highlightmirror.maxPages"/>
     </hbox>
+    <checkbox label="번역 뒤 한 번 더 다듬기: 긴 문단을 1~3문장 단위로 나누고 핵심 문장·개념에 볼드 (문장은 바꾸지 않음)"
+              preference="extensions.highlightmirror.polish" native="true" style="margin-top:4px"/>
+    <hbox align="center" style="gap:8px; margin-top:4px">
+      <label value="다듬기 모델" style="min-width: 7em"/>
+      <menulist preference="extensions.highlightmirror.polishModel" native="true">
+        <menupopup>
+          <menuitem label="Claude Sonnet 5.5 (권장)" value="claude-sonnet-5-5"/>
+          <menuitem label="Claude Haiku 5.5 (가장 저렴)" value="claude-haiku-5-5"/>
+          <menuitem label="Claude Opus 5.5" value="claude-opus-5-5"/>
+        </menupopup>
+      </menulist>
+    </hbox>
+    <html:p style="margin:6px 0 0; color: var(--fill-secondary);">
+      이미 만든 번역 노트는 아이템 우클릭 → "번역 노트 다듬기"로 같은 처리를 할 수 있습니다(원래 노트는 상태 폴더에 백업).
+    </html:p>
     <html:p style="margin:6px 0 0; color: var(--fill-secondary);">
       번역은 단락 단위로 요청되며 원문 단락과의 대응표가 함께 저장됩니다. 결과는 사용자의 라이브러리 안에만 저장됩니다(개인 연구용).
     </html:p>
