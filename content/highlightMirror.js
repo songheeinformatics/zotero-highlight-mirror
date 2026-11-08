@@ -195,15 +195,10 @@ var HighlightMirror = {
 
 		let translate = doc.createXULElement("menuitem");
 		translate.id = "hm-menu-translate";
-		translate.setAttribute("label", "원문 PDF → 번역 노트 (Claude)");
+		translate.setAttribute("label", "번역 노트 만들기·다듬기 (Claude)");
 		translate.addEventListener("command", () => this.translateSelected(window));
 
-		let polish = doc.createXULElement("menuitem");
-		polish.id = "hm-menu-polish";
-		polish.setAttribute("label", "번역 노트 다듬기 — 문단 나누기·핵심 볼드 (Claude)");
-		polish.addEventListener("command", () => this.polishSelected(window));
-
-		menu.append(sep, sync, translate, polish);
+		menu.append(sep, sync, translate);
 		this._windows.add(window);
 	},
 
@@ -303,23 +298,50 @@ ${e.stack || ""}`);
 		}
 	},
 
+	/** 대응표에 다듬기 완료 표시가 있는가(0.5.0 이후 다듬기를 거친 노트) */
+	async isPolished(note) {
+		let m = await this.state.loadMapping(note);
+		return !!(m && m.polished);
+	},
+
+	/**
+	 * 메뉴 하나로 번역과 다듬기를 처리한다.
+	 * - 노트를 직접 골랐으면: 그 노트를 다듬는다(이미 다듬었으면 확인 후).
+	 * - 논문을 골랐으면: 번역 노트가 없으면 번역(설정이 켜져 있으면 다듬기 포함),
+	 *   아직 안 다듬은 번역 노트가 있으면 그 노트를 다듬고, 모두 다듬었으면 새로 번역할지 묻는다.
+	 */
 	async translateSelected(window) {
 		let items = window.ZoteroPane.getSelectedItems();
-		this.log(`menu: translate clicked, ${items.length} item(s) selected`);
+		this.log(`menu: translate/polish clicked, ${items.length} item(s) selected`);
+		let directNotes = items.filter(i => i.isNote() && i.parentItemID);
 		let parents = new Set();
 		for (let item of items) {
 			if (item.isRegularItem()) parents.add(item);
-			else if (item.parentItemID) parents.add(Zotero.Items.get(item.parentItemID));
+			else if (item.isAttachment() && item.parentItemID) parents.add(Zotero.Items.get(item.parentItemID));
 		}
-		if (!parents.size) {
+		if (!parents.size && !directNotes.length) {
 			this.notify("대상 없음", "논문 아이템(또는 그 PDF/노트)을 선택한 뒤 실행하세요.");
 			return;
 		}
+		let toPolish = [];
+		for (let note of directNotes) {
+			if (await this.isPolished(note)
+				&& !window.confirm("이 노트는 이미 다듬었습니다. 한 번 더 다듬을까요?")) continue;
+			toPolish.push(note);
+		}
+		let toTranslate = [];
 		for (let parent of parents) {
-			if (this.hasTranslationNote(parent)) {
-				let again = window.confirm(`"${parent.getField("title").slice(0, 60)}"에는 이미 번역 노트가 있습니다. 새로 하나 더 만들까요?`);
-				if (!again) continue;
+			let notes = Zotero.Items.get(parent.getNotes()).filter(n => n.hasTag(this.TAG));
+			if (!notes.length) { toTranslate.push(parent); continue; }
+			let raw = [];
+			for (let n of notes) if (!(await this.isPolished(n))) raw.push(n);
+			if (raw.length) { toPolish.push(...raw); continue; }
+			if (window.confirm(`"${parent.getField("title").slice(0, 60)}"에는 이미 다듬은 번역 노트가 있습니다. 새로 하나 더 번역할까요?`)) {
+				toTranslate.push(parent);
 			}
+		}
+		if (toPolish.length) await this.polishNotes(toPolish);
+		for (let parent of toTranslate) {
 			try {
 				await this.translateItem(parent);
 			}
@@ -580,6 +602,8 @@ ${e.stack || ""}`);
 		let nextToAppend = 0;
 		let done = 0;
 		let failed = [];
+		let polishOn = !!this.pref("polish");
+		let polishFailed = false;
 
 		const flush = async (finalMsg) => {
 			// 연속으로 완료된 구간을 순서대로 노트에 덧붙인다
@@ -597,7 +621,9 @@ ${e.stack || ""}`);
 				: progressLine(`번역 중… ${done}/${chunks.length} 구간 완료`);
 			note.setNote([head, ...body, tail].filter(Boolean).join("\n"));
 			await note.saveTx();
-			await this.state.saveMapping(note, { pdfKey: pdf.key, headBlocks, paragraphs: map, complete: finalMsg !== undefined });
+			let m = { pdfKey: pdf.key, headBlocks, paragraphs: map, complete: finalMsg !== undefined };
+			if (finalMsg !== undefined && polishOn && !polishFailed) m.polished = new Date().toISOString();
+			await this.state.saveMapping(note, m);
 		};
 
 		// 2) 구간 2개씩 동시에 번역, 완료되는 대로 순서 맞춰 추가
@@ -607,9 +633,12 @@ ${e.stack || ""}`);
 				let i = cursor++;
 				try {
 					let blocks = await this.claude.translateChunk(chunks[i], { lang, title });
-					if (this.pref("polish")) {
-						try { blocks = await this.polishBlocks(blocks); }
-						catch (e) { this.log(`polish chunk ${i + 1} failed, keeping raw translation: ${e}`); }
+					if (polishOn) {
+						try {
+							blocks = await this.polishBlocks(blocks);
+							if (blocks.failedBatches) polishFailed = true;
+						}
+						catch (e) { polishFailed = true; this.log(`polish chunk ${i + 1} failed, keeping raw translation: ${e}`); }
 					}
 					results[i] = blocks;
 				}
@@ -675,6 +704,7 @@ ${e.stack || ""}`);
 		});
 		if (cur.length) batches.push(cur);
 		let out = new Array(texts.length).fill(null);
+		out.failedBatches = 0;
 		let next = 0;
 		const worker = async () => {
 			while (next < batches.length) {
@@ -684,6 +714,7 @@ ${e.stack || ""}`);
 					b.forEach((i, k) => { out[i] = res[k]; });
 				}
 				catch (e) {
+					out.failedBatches++;
 					this.log(`polish batch failed: ${e}`);
 				}
 			}
@@ -710,6 +741,7 @@ ${e.stack || ""}`);
 		});
 		let changed = res.filter(Boolean).length;
 		this.log(`polish: ${changed}/${idx.length} paragraphs reformatted`);
+		out.failedBatches = res.failedBatches;
 		return out;
 	},
 
@@ -737,7 +769,12 @@ ${e.stack || ""}`);
 			let text = clone.textContent.replace(/\s+/g, " ").trim();
 			if (this.polishable(text)) cands.push({ el, leafIndex, text });
 		});
-		if (!cands.length) return { paragraphs: 0, changed: 0 };
+		const markPolished = async () => {
+			let m = mapping || {};
+			m.polished = new Date().toISOString();
+			await this.state.saveMapping(note, m);
+		};
+		if (!cands.length) { await markPolished(); return { paragraphs: 0, changed: 0 }; }
 
 		let res = await this.polishTexts(cands.map(c => c.text));
 		let splits = new Map();
@@ -755,7 +792,10 @@ ${e.stack || ""}`);
 			splits.set(c.leafIndex, parts.length);
 		});
 		let changed = splits.size;
-		if (!changed) return { paragraphs: cands.length, changed: 0 };
+		if (!changed) {
+			if (!res.failedBatches) await markPolished();
+			return { paragraphs: cands.length, changed: 0, failedBatches: res.failedBatches };
+		}
 
 		await this.state.ensureDir();
 		let stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -769,22 +809,17 @@ ${e.stack || ""}`);
 				for (let n = 0; n < k; n++) paras.push(entry);
 			});
 			mapping.paragraphs = paras;
-			mapping.polished = new Date().toISOString();
-			await this.state.saveMapping(note, mapping);
 		}
+		if (mapping) mapping.polished = res.failedBatches ? undefined : new Date().toISOString();
+		if (mapping) await this.state.saveMapping(note, mapping);
+		else if (!res.failedBatches) await markPolished();
 		note.setNote(doc.body.innerHTML);
 		await note.saveTx();
 		this.log(`polishNote ${note.key}: ${changed}/${cands.length} paragraphs, backup ${backup}`);
-		return { paragraphs: cands.length, changed, backup };
+		return { paragraphs: cands.length, changed, backup, failedBatches: res.failedBatches };
 	},
 
-	async polishSelected(window) {
-		let items = window.ZoteroPane.getSelectedItems();
-		let notes = this._collectNotes(items).filter(n => items.includes(n) || n.hasTag(this.TAG));
-		if (!notes.length) {
-			this.notify("대상 없음", "Highlight Mirror 번역 노트가 있는 아이템이나 노트를 선택하세요.");
-			return;
-		}
+	async polishNotes(notes) {
 		if (!(this.pref("apiKey") || "").trim()) {
 			this.notify("API 키 없음", "설정 → Highlight Mirror에서 Claude API 키를 입력하세요.");
 			return;
@@ -1554,6 +1589,7 @@ ${e.stack || ""}`);
 					sync: !!w.document.getElementById("hm-menu-sync"),
 					translate: !!w.document.getElementById("hm-menu-translate"),
 					itemmenu: !!w.document.getElementById("zotero-itemmenu"),
+					labels: [...w.document.querySelectorAll("[id^='hm-menu-']")].map(el => el.getAttribute("label")).filter(Boolean),
 				}));
 				return {
 					plugin: "highlight-mirror",
