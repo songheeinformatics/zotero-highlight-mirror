@@ -304,6 +304,14 @@ ${e.stack || ""}`);
 		return !!(m && m.polished);
 	},
 
+	/** 번역이 끝나지 않았거나(진행 줄이 남음) 실패한 구간이 있는 노트인가 */
+	async isBroken(note) {
+		let html = note.getNote();
+		if (/<em>⏳ |\[구간 \d+ 번역 실패/.test(html)) return true;
+		let m = await this.state.loadMapping(note);
+		return !!(m && m.complete === false);
+	},
+
 	/**
 	 * 메뉴 하나로 번역과 다듬기를 처리한다.
 	 * - 노트를 직접 골랐으면: 그 노트를 다듬는다(이미 다듬었으면 확인 후).
@@ -333,8 +341,17 @@ ${e.stack || ""}`);
 		for (let parent of parents) {
 			let notes = Zotero.Items.get(parent.getNotes()).filter(n => n.hasTag(this.TAG));
 			if (!notes.length) { toTranslate.push(parent); continue; }
+			// 끝나지 않았거나 실패한 구간이 남은 노트는 다듬기 대상이 아니라 다시 번역할 대상
+			let broken = [];
+			for (let n of notes) if (await this.isBroken(n)) broken.push(n);
+			if (broken.length === notes.length) {
+				if (window.confirm(`"${parent.getField("title").slice(0, 60)}"의 번역 노트는 끝나지 않았거나 실패한 구간이 있습니다. 새로 번역할까요? (기존 노트는 그대로 둡니다)`)) {
+					toTranslate.push(parent);
+				}
+				continue;
+			}
 			let raw = [];
-			for (let n of notes) if (!(await this.isPolished(n))) raw.push(n);
+			for (let n of notes) if (!broken.includes(n) && !directNotes.includes(n) && !(await this.isPolished(n))) raw.push(n);
 			if (raw.length) { toPolish.push(...raw); continue; }
 			if (window.confirm(`"${parent.getField("title").slice(0, 60)}"에는 이미 다듬은 번역 노트가 있습니다. 새로 하나 더 번역할까요?`)) {
 				toTranslate.push(parent);
@@ -417,7 +434,8 @@ ${e.stack || ""}`);
 		let located = [];
 		let needClaude = [];
 		for (let h of pending) {
-			let direct = this.matcher.findInDocument(pages, h.text);
+			// 힌트 페이지부터 찾는다 — 짧은 영문 구절은 문서 여러 곳에 있을 수 있다
+			let direct = this.matcher.findInDocument(pages, h.text, this.claude.hintPage(h, mapping));
 			if (direct) located.push({ hash: h.hash, pageIndex: direct.pageIndex, quote: h.text, direct });
 			else needClaude.push(h);
 		}
@@ -560,7 +578,18 @@ ${e.stack || ""}`);
 		return { html, leaves };
 	},
 
-	async translateItem(parent, { pages } = {}) {
+	/**
+	 * 번역은 한 번에 하나만 돌린다(자동 번역이 여러 PDF에 동시에 걸리면 API 호출이 몰려
+	 * 429·타임아웃으로 구간이 빠지던 문제). 메뉴·자동·서버 엔드포인트 모두 이 줄을 탄다.
+	 */
+	translateItem(parent, opts = {}) {
+		let run = () => this._translateItem(parent, opts);
+		let p = (this._translateQueue || Promise.resolve()).then(run, run);
+		this._translateQueue = p.catch(() => {});
+		return p;
+	},
+
+	async _translateItem(parent, { pages } = {}) {
 		let pdf = await this.findPDF(parent);
 		if (!pdf) {
 			this.notify("PDF 없음", "선택한 아이템에 PDF 첨부가 없습니다.");
@@ -632,7 +661,7 @@ ${e.stack || ""}`);
 			while (cursor < chunks.length) {
 				let i = cursor++;
 				try {
-					let blocks = await this.claude.translateChunk(chunks[i], { lang, title });
+					let blocks = await this.claude.translateChunk(chunks[i], { lang, title, ...this.pdfText.chunkContext(chunks, i) });
 					if (polishOn) {
 						try {
 							blocks = await this.polishBlocks(blocks);
@@ -1074,16 +1103,28 @@ ${e.stack || ""}`);
 				&& page.index === 0;
 		},
 
+		/** 페이지 위아래 가장자리 줄 수 — 머리글·꼬리글·쪽번호는 여기에만 있다 */
+		EDGE_LINES: 3,
+
+		/** 문장이 끝나는 조각인가(마침표·물음표 등, 닫는 따옴표·괄호 허용) */
+		endsSentence(s) {
+			return /[.!?:;]["'’”)\]]?$/.test(s);
+		},
+
 		/**
-		 * 여러 페이지에 반복되는 줄(머리글·꼬리글), 쪽번호만 있는 줄을 골라낸다.
-		 * @returns {Set<string>} 제거할 줄의 정규화 키
+		 * 여러 페이지에 반복되는 줄(머리글·꼬리글)을 골라낸다.
+		 * 본문 끝줄("et al., 2019)." 같은 짧은 줄)이 우연히 반복돼 지워지지 않도록
+		 * 페이지 위아래 가장자리 줄만 센다.
+		 * @returns {{drop:Set<string>, norm:Function}} 제거할 줄의 정규화 키
 		 */
 		runningLines(pages) {
 			let count = new Map();
 			let norm = s => s.replace(/\d+/g, "#").replace(/\s+/g, " ").trim().toLowerCase();
 			for (let p of pages) {
 				let seen = new Set();
-				for (let line of p.text.split("\n")) {
+				let lines = p.text.split("\n").map(s => s.trim()).filter(Boolean);
+				let edge = lines.filter((_, i) => i < this.EDGE_LINES || i >= lines.length - this.EDGE_LINES);
+				for (let line of edge) {
 					let k = norm(line);
 					if (k.length < 3 || k.length > 90 || seen.has(k)) continue;
 					seen.add(k);
@@ -1096,52 +1137,87 @@ ${e.stack || ""}`);
 			return { drop, norm };
 		},
 
-		/** 페이지 텍스트를 단락으로 쪼갠다(빈 줄/문장 끝 + 짧은 줄 휴리스틱). */
+		/**
+		 * 페이지 텍스트를 단락으로 쪼갠다(문장 끝 + 짧은 줄 휴리스틱).
+		 * 페이지 끝에서 문장이 안 끝났으면 버퍼를 다음 페이지로 넘겨 한 문장이 두 조각으로 갈라지지 않게 한다
+		 * (갈라지면 구간 경계에 걸렸을 때 Claude가 반쪽 문장을 받아 앞뒤를 지어낸다).
+		 * 단락의 page는 시작한 페이지다.
+		 */
 		toParagraphs(pages) {
 			let paras = [];
 			let { drop, norm } = this.runningLines(pages);
+			let buf = [];
+			let bufPage = 0;
+			const flush = (pageIndex) => {
+				if (!buf.length) return;
+				// 줄 끝 하이픈으로 갈라진 단어 이어붙이기(페이지 경계 포함)
+				paras.push({ page: bufPage, text: buf.join(" ").replace(/-\s+(?=[a-z])/g, ""), kind: "para" });
+				buf = [];
+				bufPage = pageIndex;
+			};
 			for (let p of pages) {
 				if (this.isCoverPage(p)) continue;
-				let lines = p.text.split("\n").map(s => s.trim()).filter(Boolean)
-					.filter(l => !drop.has(norm(l)) && !/^\d{1,4}$/.test(l));
-				let buf = [];
+				let all = p.text.split("\n").map(s => s.trim()).filter(Boolean);
+				let lines = all.filter((l, i) => !drop.has(norm(l))
+					&& !(/^\d{1,4}$/.test(l) && (i < this.EDGE_LINES || i >= all.length - this.EDGE_LINES)));
+				if (!buf.length) bufPage = p.index;
 				for (let i = 0; i < lines.length; i++) {
 					let line = lines[i];
-					buf.push(line);
-					let endsSentence = /[.!?:;]["')\]]?$/.test(line);
 					let next = lines[i + 1];
 					let short = line.length < 45;
 					let isHeading = /^(\d+(\.\d+)*\.?\s+\S|[A-Z][A-Za-z ]{2,40}$|Abstract|References|Introduction|Conclusion)/.test(line) && short;
-					if (isHeading && buf.length === 1) {
+					if (isHeading && !buf.length) {
 						paras.push({ page: p.index, text: line, kind: "heading" });
-						buf = [];
+						bufPage = p.index;
 						continue;
 					}
-					if (!next || (endsSentence && (short || next.length < 45 || /^[A-Z0-9(]/.test(next) && line.length < 60))) {
-						paras.push({ page: p.index, text: buf.join(" ").replace(/-\s+(?=[a-z])/g, ""), kind: "para" });
-						buf = [];
+					if (!buf.length) bufPage = p.index;
+					buf.push(line);
+					let endsSentence = this.endsSentence(line);
+					if (!next) {
+						// 페이지 끝: 문장이 끝났을 때만 단락을 닫고, 아니면 다음 페이지로 이어 간다
+						if (endsSentence) flush(p.index);
+					}
+					else if (endsSentence && (short || next.length < 45 || /^[A-Z0-9(]/.test(next) && line.length < 60)) {
+						flush(p.index);
 					}
 				}
-				if (buf.length) paras.push({ page: p.index, text: buf.join(" "), kind: "para" });
 			}
+			flush(0);
 			return paras.filter(x => x.text.length > 1);
 		},
 
-		chunkParagraphs(paras, maxChars) {
+		/**
+		 * 단락을 번역 구간으로 묶는다. 구간 경계는 문장이 끝난 조각 뒤, 문장을 새로 시작하는 조각 앞에만 두고
+		 * (소문자로 시작하는 조각은 앞 문장의 나머지 — 예: 사이드바 박스가 문장 중간에 끼어든 경우),
+		 * 어쩔 수 없이 넘치는 조각은 hardMax(기본 2배)까지 허용한다. 절 제목 앞에서는 되도록 끊는다.
+		 */
+		chunkParagraphs(paras, maxChars, hardMax = maxChars * 2) {
 			let chunks = [];
 			let cur = [];
 			let len = 0;
+			const cut = () => { if (cur.length) { chunks.push(cur); cur = []; len = 0; } };
 			for (let p of paras) {
-				if (len + p.text.length > maxChars && cur.length) {
-					chunks.push(cur);
-					cur = [];
-					len = 0;
-				}
+				let last = cur[cur.length - 1];
+				let lastDone = !last || last.kind === "heading" || this.endsSentence(last.text);
+				let startsNew = p.kind === "heading" || !/^\p{Ll}/u.test(p.text);
+				let boundary = lastDone && startsNew;
+				if (cur.length && p.kind === "heading" && len >= maxChars * 0.6 && lastDone) cut();
+				else if (cur.length && len + p.text.length > maxChars && (boundary || len + p.text.length > hardMax)) cut();
 				cur.push(p);
 				len += p.text.length;
 			}
-			if (cur.length) chunks.push(cur);
+			cut();
 			return chunks;
+		},
+
+		/** 구간 앞뒤 문맥(번역하지 않고 참고만): 앞 구간의 끝과 뒤 구간의 시작 */
+		chunkContext(chunks, i, chars = 400) {
+			let prev = chunks[i - 1];
+			let next = chunks[i + 1];
+			let before = prev ? prev.map(p => p.text).join(" ").slice(-chars) : "";
+			let after = next ? next.map(p => p.text).join(" ").slice(0, chars) : "";
+			return { before, after };
 		},
 	},
 
@@ -1256,6 +1332,17 @@ ${e.stack || ""}`);
 			return /^claude-(opus-5|sonnet-5-5|fable)/.test(model);
 		},
 
+		/** 재시도 간격(ms): 429·529·5xx·타임아웃·네트워크 오류일 때 */
+		RETRY_DELAYS: [5000, 15000, 45000],
+
+		/** 다시 시도할 만한 오류인가 — 상태 코드가 없으면 타임아웃·네트워크 끊김으로 본다 */
+		retryable(e) {
+			let status = e?.status ?? e?.xmlhttp?.status;
+			if (status === 429 || status === 408 || status === 409 || (status >= 500 && status < 600)) return true;
+			if (status) return false;
+			return /timeout|timed out|offline|network|NS_ERROR|connection/i.test(e?.message || String(e)) || !status;
+		},
+
 		async request({ system, user, maxTokens = 16000, model }) {
 			let apiKey = (HighlightMirror.pref("apiKey") || "").trim();
 			if (!apiKey) {
@@ -1279,18 +1366,31 @@ ${e.stack || ""}`);
 				body.fallbacks = "default";
 			}
 			let xhr;
-			try {
-				xhr = await Zotero.HTTP.request("POST", HighlightMirror.API_URL, {
-					headers,
-					body: JSON.stringify(body),
-					responseType: "json",
-					timeout: 180000,
-				});
-			}
-			catch (e) {
-				let detail = e.xmlhttp?.responseText || e.message || String(e);
-				try { detail = JSON.parse(detail).error?.message || detail; } catch (_) { /* raw */ }
-				throw new Error(`Claude API 오류: ${detail}`);
+			for (let attempt = 0; ; attempt++) {
+				try {
+					xhr = await Zotero.HTTP.request("POST", HighlightMirror.API_URL, {
+						headers,
+						body: JSON.stringify(body),
+						responseType: "json",
+						timeout: 300000,
+					});
+					break;
+				}
+				catch (e) {
+					let delay = this.RETRY_DELAYS[attempt];
+					if (delay !== undefined && this.retryable(e)) {
+						// 서버가 Retry-After를 주면 그만큼(최대 2분) 기다린다
+						let ra = Number(e.xmlhttp?.getResponseHeader?.("retry-after"));
+						if (ra > 0) delay = Math.min(ra * 1000, 120000);
+						let status = e.status ?? e.xmlhttp?.status ?? "no-status";
+						HighlightMirror.log(`Claude API ${status}, retry ${attempt + 1}/${this.RETRY_DELAYS.length} in ${delay}ms: ${e.message || e}`);
+						await Zotero.Promise.delay(delay);
+						continue;
+					}
+					let detail = e.xmlhttp?.responseText || e.message || String(e);
+					try { detail = JSON.parse(detail).error?.message || detail; } catch (_) { /* raw */ }
+					throw new Error(`Claude API 오류: ${detail}`);
+				}
 			}
 			let res = xhr.response;
 			if (res.stop_reason === "refusal") {
@@ -1340,10 +1440,19 @@ ${e.stack || ""}`);
 		},
 
 		hintFor(h, mapping) {
+			let p = this.hintEntry(h, mapping);
+			return p ? `page ${p.page}, paragraph starting "${p.src}"` : null;
+		},
+
+		hintPage(h, mapping) {
+			let p = this.hintEntry(h, mapping);
+			return p && Number.isInteger(p.page) ? p.page : undefined;
+		},
+
+		hintEntry(h, mapping) {
 			if (!mapping || !mapping.paragraphs) return null;
 			// 번역 노트의 단락 해시가 아니라 포함 관계로 찾는 건 비용이 커서, 블록 순서 기반 근사
-			let p = mapping.paragraphs[h.block - (mapping.headBlocks ?? 2)]; // 머리 블록 뒤부터 본문
-			return p ? `page ${p.page}, paragraph starting "${p.src}"` : null;
+			return mapping.paragraphs[h.block - (mapping.headBlocks ?? 2)] || null; // 머리 블록 뒤부터 본문
 		},
 
 		/**
@@ -1351,8 +1460,11 @@ ${e.stack || ""}`);
 		 * 각 블록에는 원문 첫 단어들(src)과 페이지를 붙여 대응표에 쓴다.
 		 * @returns {Array<{type, page, src, text?, items?, caption?, header?, rows?, note?}>}
 		 */
-		async translateChunk(paras, { lang, title }) {
+		async translateChunk(paras, { lang, title, before = "", after = "" }) {
 			let numbered = paras.map((p, i) => `[${i + 1}] (page ${p.page}) ${p.text}`).join("\n\n");
+			let context = "";
+			if (before) context += `CONTEXT BEFORE (end of the previous chunk — for reference only, do NOT translate or output it):\n…${before}\n\n`;
+			if (after) context += `CONTEXT AFTER (start of the next chunk — for reference only, do NOT translate or output it):\n${after}…\n\n`;
 			let system = [
 				`You are translating an academic paper into ${lang} for a researcher's private study notes, producing a well-structured document (as a careful human translator would), not a flat dump of sentences.`,
 				"Context: the researcher legally holds this paper and reads it through a translation stored only inside their own Zotero library. This is personal, non-distributed research use; a faithful full translation is required so that each translated block can later be mapped back to the original passage.",
@@ -1375,9 +1487,10 @@ ${e.stack || ""}`);
 				"- Use **double asterisks** to bold a term that is bolded or being defined in the source (e.g. **이론(Theory)**은 …).",
 				"- Reference list: when the bibliography begins, emit its heading as h1 \"참고문헌(References)\" followed by ONE paragraph: \"원문의 참고문헌 목록은 서지정보의 정확성을 위해 번역하지 않고 원문 표기를 유지한다.\" — then skip every entry. If the fragments are all bibliography entries (the list began in an earlier chunk), skip them all.",
 				"- Author biographies, acknowledgements and disclosure statements are translated as normal sections.",
+				"- If a fragment begins or ends mid-sentence, translate exactly what is there (the rest belongs to a neighbouring chunk); use the CONTEXT passages only to understand the sentence. Never invent or bracket missing words.",
 				"- Never output anything before or after the JSON array. Escape quotes inside strings. No HTML or Markdown other than ** for bold.",
 			].join("\n");
-			let user = `Paper: ${title}\n\n${numbered}`;
+			let user = `Paper: ${title}\n\n${context}FRAGMENTS TO TRANSLATE:\n${numbered}`;
 			let { text, usage } = await this.request({ system, user, maxTokens: 24000 });
 			HighlightMirror.log(`translate usage: ${JSON.stringify(usage)}`);
 			let arr = this.parseJSONArray(text);

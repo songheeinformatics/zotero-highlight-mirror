@@ -3,8 +3,8 @@
     "highlight-mirror@songhee.kr": {
       "updates": [
         {
-          "version": "0.5.1",
-          "update_link": "https://github.com/songheeinformatics/zotero-highlight-mirror/releases/download/v0.5.1/highlight-mirror-0.5.1.xpi",
+          "version": "0.5.2",
+          "update_link": "https://github.com/songheeinformatics/zotero-highlight-mirror/releases/download/v0.5.2/highlight-mirror-0.5.2.xpi",
           "applications": {
             "zotero": {
               "strict_min_version": "7.0"
