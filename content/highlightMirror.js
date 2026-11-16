@@ -661,7 +661,21 @@ ${e.stack || ""}`);
 			while (cursor < chunks.length) {
 				let i = cursor++;
 				try {
-					let blocks = await this.claude.translateChunk(chunks[i], { lang, title, ...this.pdfText.chunkContext(chunks, i) });
+					let ctx = this.pdfText.chunkContext(chunks, i);
+					let blocks = await this.claude.translateChunk(chunks[i], { lang, title, ...ctx });
+					if (this.pref("recheck")) {
+						// 증상이 있는 구간만 원문과 다시 대조해 고친다(비용은 그 구간 번역 1회분)
+						let problems = this.suspicious(blocks);
+						if (problems.length) {
+							this.log(`recheck chunk ${i + 1}: ${problems.map(p => `#${p.index + 1} ${p.reason}`).join("; ")}`);
+							try {
+								blocks = await this.claude.reviewChunk(chunks[i], blocks, { lang, title, problems, ...ctx });
+								let left = this.suspicious(blocks);
+								if (left.length) this.log(`recheck chunk ${i + 1}: still ${left.map(p => `#${p.index + 1} ${p.reason}`).join("; ")}`);
+							}
+							catch (e) { this.log(`recheck chunk ${i + 1} failed, keeping first pass: ${e}`); }
+						}
+					}
 					if (polishOn) {
 						try {
 							blocks = await this.polishBlocks(blocks);
@@ -690,6 +704,30 @@ ${e.stack || ""}`);
 		line.setProgress(100);
 		pw.startCloseTimer(2000);
 		this.notify("번역 노트 완성", `${body.length}개 블록${failed.length ? `, 실패 ${failed.length}구간` : ""}, 원문 대응표 저장됨`);
+	},
+
+	/**
+	 * 1차 번역 블록에서 재검수가 필요한 증상을 찾는다.
+	 * 말줄임표·소문자 영문으로 시작(반쪽 문장), 대괄호 안 한글(지어낸 말), 문장 미종결 단락.
+	 * @returns {Array<{index:number, reason:string}>}
+	 */
+	suspicious(blocks) {
+		const END = /[.!?。…"”’'」』)\]:]$/;
+		let out = [];
+		blocks.forEach((b, i) => {
+			let texts = [];
+			if (typeof b.text === "string") texts.push(b.text);
+			if (Array.isArray(b.items)) texts.push(...b.items.map(x => String(x ?? "")));
+			for (let t of texts) {
+				t = t.trim();
+				if (!t) continue;
+				if (/^(…|⋯|\.{3})/.test(t)) out.push({ index: i, reason: "starts with an ellipsis (second half of a sentence)" });
+				else if (/^\p{Ll}/u.test(t)) out.push({ index: i, reason: "starts mid-sentence with a lowercase English word" });
+				else if (/\[[^\]\n]*\p{Script=Hangul}[^\]\n]*\]/u.test(t)) out.push({ index: i, reason: "contains bracketed words not in the source" });
+				else if (b.type === "p" && t.length > 60 && !END.test(t)) out.push({ index: i, reason: "ends mid-sentence" });
+			}
+		});
+		return out;
 	},
 
 	// ------------------------------------------- 3) 2차 편집 패스(문단 나누기·핵심 볼드)
@@ -1145,46 +1183,230 @@ ${e.stack || ""}`);
 		 */
 		toParagraphs(pages) {
 			let paras = [];
+			let asides = []; // 페이지 아래 각주·저자 소개·저작권 줄 — 본문 흐름에서 빼서 뒤에 모은다
 			let { drop, norm } = this.runningLines(pages);
+			let B = this.bodyHeight(pages);
 			let buf = [];
 			let bufPage = 0;
+			let bufSmall = false;  // 단락 첫 줄이 작은 글씨(인용 블록)인가
+			let lastSmall = false; // 바로 앞 줄이 작은 글씨인가(크기 전환 감지용)
 			const flush = (pageIndex) => {
 				if (!buf.length) return;
 				// 줄 끝 하이픈으로 갈라진 단어 이어붙이기(페이지 경계 포함)
-				paras.push({ page: bufPage, text: buf.join(" ").replace(/-\s+(?=[a-z])/g, ""), kind: "para" });
+				let para = { page: bufPage, text: buf.join(" ").replace(/-\s+(?=[a-z])/g, ""), kind: "para" };
+				if (bufSmall) para.quote = true;
+				paras.push(para);
 				buf = [];
 				bufPage = pageIndex;
 			};
 			for (let p of pages) {
 				if (this.isCoverPage(p)) continue;
-				let all = p.text.split("\n").map(s => s.trim()).filter(Boolean);
-				let lines = all.filter((l, i) => !drop.has(norm(l))
-					&& !(/^\d{1,4}$/.test(l) && (i < this.EDGE_LINES || i >= all.length - this.EDGE_LINES)));
+				let meta = this.pageLines(p);
+				let zone = this.layoutZones(meta, B);
+				let pageAside = [];
+				let lines = [];
+				meta.forEach((m, i) => {
+					let l = m.text;
+					if (drop.has(norm(l))) return;
+					if (/^\d{1,4}$/.test(l) && (i < this.EDGE_LINES || i >= meta.length - this.EDGE_LINES)) return;
+					if (zone[i] === "furniture") return;
+					if (zone[i] === "aside") pageAside.push(m);
+					else lines.push(m);
+				});
+				if (pageAside.length) asides.push(...this.asideParagraphs(pageAside, p.index, B));
 				if (!buf.length) bufPage = p.index;
 				for (let i = 0; i < lines.length; i++) {
-					let line = lines[i];
-					let next = lines[i + 1];
+					let line = lines[i].text;
+					let h = lines[i].h;
+					let next = lines[i + 1] && lines[i + 1].text;
 					let short = line.length < 45;
+					let small = B > 0 && h < B * 0.92;
+					let large = B > 0 && h > B * 1.12 && line.length > 2 && line.length < 120;
+					// 제목보다 큰 글자(논문 제목·저자명): 비슷한 크기의 연속 줄을 한 제목으로 묶는다
+					if (large) {
+						flush(p.index);
+						let last = paras[paras.length - 1];
+						if (last && last.large && last.page === p.index && Math.abs(last.h - h) < h * 0.08) last.text += " " + line;
+						else paras.push({ page: p.index, text: line, kind: "heading", large: true, h });
+						bufPage = p.index;
+						continue;
+					}
+					// 글자 크기가 바뀌는 곳(본문 ↔ 인용 블록)은 문장이 이어지지 않는 한 단락을 나눈다
+					if (buf.length && small !== lastSmall) {
+						let prev = buf[buf.length - 1];
+						if (small && !this.endsSentence(prev) && prev.length < 80 && /^[A-Z]/.test(prev)
+							&& (buf.length === 1 || this.endsSentence(buf[buf.length - 2]))) {
+							// 문장이 끝난 뒤 본문 크기 한 줄, 그리고 바로 인용 블록: 그 한 줄은 소제목("Trading: negotiating the …")
+							buf.pop();
+							flush(p.index);
+							paras.push({ page: p.index, text: prev, kind: "heading" });
+						}
+						else if (this.endsSentence(prev) || /[)’'”]$/.test(prev) || /^[A-Z`‘'"“(]/.test(line)) flush(p.index);
+					}
+					lastSmall = small;
 					let isHeading = /^(\d+(\.\d+)*\.?\s+\S|[A-Z][A-Za-z ]{2,40}$|Abstract|References|Introduction|Conclusion)/.test(line) && short;
+					// 문장이 안 끝난 채 제목 줄(사이드바 박스·절 제목)이 오면 지금까지를 미완성 단락으로 닫는다
+					// — 뒤에서 reattachOrphans가 이어지는 조각을 찾아 붙인다
+					if (isHeading && buf.length && !this.endsSentence(buf[buf.length - 1]) && !/[.,;:]$/.test(line)) flush(p.index);
 					if (isHeading && !buf.length) {
 						paras.push({ page: p.index, text: line, kind: "heading" });
 						bufPage = p.index;
 						continue;
 					}
-					if (!buf.length) bufPage = p.index;
+					if (!buf.length) { bufPage = p.index; bufSmall = small; }
 					buf.push(line);
 					let endsSentence = this.endsSentence(line);
 					if (!next) {
 						// 페이지 끝: 문장이 끝났을 때만 단락을 닫고, 아니면 다음 페이지로 이어 간다
 						if (endsSentence) flush(p.index);
 					}
-					else if (endsSentence && (short || next.length < 45 || /^[A-Z0-9(]/.test(next) && line.length < 60)) {
+					else if (endsSentence && (short || next.length < 45 || /^[A-Z0-9(]/.test(next) && line.length < 60 || /^\d{1,2}\.\s+\S/.test(next))) {
 						flush(p.index);
 					}
 				}
 			}
 			flush(0);
-			return paras.filter(x => x.text.length > 1);
+			paras = paras.filter(x => x.text.length > 1);
+			if (asides.length) {
+				// 각주·저자 소개는 주(Notes)·참고문헌 앞에, 없으면 맨 끝에 별도 절로 둔다
+				let at = paras.findIndex(x => x.kind === "heading" && /^(Notes|Endnotes|References|Bibliography|Acknowledg)/i.test(x.text));
+				if (at < 0) at = paras.length;
+				let head = { page: asides[0].page, text: "Page-bottom notes (footnotes and author information)", kind: "heading", synthetic: true };
+				paras.splice(at, 0, head, ...asides);
+			}
+			return this.reattachOrphans(paras);
+		},
+
+		/** 페이지의 줄(스트림 순서)과 글자 높이·위치. p.text의 줄과 1:1로 대응한다. */
+		pageLines(p) {
+			let groups = [];
+			for (let w of p.words) {
+				let g = groups[groups.length - 1];
+				if (!g || g.line !== w.line) groups.push(g = { line: w.line, words: [] });
+				g.words.push(w);
+			}
+			return groups.map(g => {
+				let hs = g.words.map(w => w.y1 - w.y0).sort((a, b) => a - b);
+				return {
+					text: g.words.map(w => w.t).join(" ").trim(),
+					h: hs[Math.floor(hs.length / 2)],
+					top: Math.max(...g.words.map(w => w.y1)),
+					bottom: Math.min(...g.words.map(w => w.y0)),
+					left: Math.min(...g.words.map(w => w.x0)),
+				};
+			}).filter(l => l.text);
+		},
+
+		/** 본문 글자 높이: 글자 수로 가중한 최빈값 */
+		bodyHeight(pages) {
+			let hist = new Map();
+			for (let p of pages) {
+				if (this.isCoverPage(p)) continue;
+				for (let l of this.pageLines(p)) {
+					let k = Math.round(l.h * 4) / 4;
+					hist.set(k, (hist.get(k) || 0) + l.text.length);
+				}
+			}
+			let best = 0, bestN = -1;
+			for (let [k, n] of hist) if (n > bestN) { best = k; bestN = n; }
+			return best;
+		},
+
+		/**
+		 * 줄마다 main / furniture(맨 위 작은 글씨 머리글) / aside(맨 아래 작은 글씨 각주·저자 소개)를 정한다.
+		 * pdf.js는 각주·저자 소개를 본문 사이 아무 데나 내놓으므로 위치와 글자 크기로 가려낸다.
+		 * 본문 줄이 적은 페이지(주·참고문헌 쪽)는 건드리지 않는다.
+		 */
+		layoutZones(lines, B) {
+			let zone = lines.map(() => "main");
+			if (!B) return zone;
+			const small = l => l.h < B * 0.92;
+			let body = lines.filter(l => Math.abs(l.h - B) <= B * 0.08);
+			if (body.length < 5) return zone;
+			let lowest = Math.min(...body.map(l => l.bottom));
+			let medianLen = body.map(l => l.text.length).sort((a, b) => a - b)[Math.floor(body.length / 2)];
+			let bodyLeft = body.map(l => l.left).sort((a, b) => a - b)[Math.floor(body.length * 0.2)];
+
+			// 아래쪽: 가장 낮은 본문 줄 밑에서 줄 간격보다 확실히 큰 틈 뒤에 오는 작은 글씨 묶음
+			let below = lines.map((l, i) => ({ l, i })).filter(x => small(x.l) && x.l.top < lowest)
+				.sort((a, b) => b.l.top - a.l.top);
+			let prevBottom = lowest;
+			for (let k = 0; k < below.length; k++) {
+				if (prevBottom - below[k].l.top > B * 1.2) {
+					let rest = below.slice(k);
+					let lens = rest.map(x => x.l.text.length).sort((a, b) => a - b);
+					// 산문 줄(각주·소개)만: 짧은 셀 조각들(표)은 본문에 두고,
+					// 첫 줄을 들여 쓴 묶음(페이지 끝 인용 블록)도 본문에 둔다 — 각주 첫 줄은 본문 왼쪽 여백에서 시작한다
+					if (lens[Math.floor(lens.length / 2)] >= medianLen * 0.5
+						&& rest[0].l.left <= bodyLeft + B * 0.6) for (let x of rest) zone[x.i] = "aside";
+					break;
+				}
+				prevBottom = below[k].l.bottom;
+			}
+
+			// 위쪽: 모든 큰 글씨·본문 줄보다 위, 큰 틈으로 떨어진 짧은 작은 글씨(학술지 머리글)
+			let highest = Math.max(...lines.filter(l => !small(l)).map(l => l.top));
+			let above = lines.map((l, i) => ({ l, i })).filter(x => small(x.l) && x.l.bottom > highest)
+				.sort((a, b) => a.l.bottom - b.l.bottom);
+			if (above.length && above.length <= 3 && above[0].l.bottom - highest > B * 1.2
+				&& above.every(x => x.l.text.length < 100)) for (let x of above) zone[x.i] = "furniture";
+			return zone;
+		},
+
+		/** 페이지 아래 작은 글씨 줄을 단락으로 묶는다(글자 크기가 바뀌거나 문장이 끝나고 새 항목이 시작될 때 나눔). */
+		asideParagraphs(lines, page, B) {
+			let out = [];
+			let buf = [];
+			let bufH = 0;
+			const flush = () => {
+				if (buf.length) out.push({ page, text: buf.join(" ").replace(/-\s+(?=[a-z])/g, ""), kind: "para", aside: true });
+				buf = [];
+			};
+			lines.sort((a, b) => b.top - a.top);
+			for (let l of lines) {
+				let prev = buf[buf.length - 1];
+				if (buf.length && (Math.abs(l.h - bufH) > B * 0.08 || this.endsSentence(prev) && /^(\d{1,2}[.)]?\s|[*†‡§¶])/.test(l.text))) flush();
+				if (!buf.length) bufH = l.h;
+				buf.push(l.text);
+			}
+			flush();
+			return out;
+		},
+
+		/**
+		 * 사이드바 박스·표·그림이 문장 한가운데 끼어들면 앞 반쪽은 문장이 안 끝난 채 남고
+		 * 뒷 반쪽은 소문자로 시작하는 조각이 된다(예: 2쪽 "…abstract and" / 박스 / 3쪽 "detached…").
+		 * 소문자로 시작하는 조각을 가까운 앞쪽의 미완성 단락에 다시 붙여 한 문장으로 만든다.
+		 */
+		reattachOrphans(paras, lookback = 12) {
+			for (let i = 1; i < paras.length; i++) {
+				let p = paras[i];
+				if (p.kind !== "para" || !/^\p{Ll}/u.test(p.text)) continue;
+				for (let j = i - 1; j >= Math.max(0, i - lookback); j--) {
+					let h = paras[j];
+					if (p.quote && j !== i - 1) break;
+					// "…as he puts it:" 뒤의 소문자 조각은 인용 블록의 시작이지 끊긴 문장이 아니다
+					if (/:["'’”]?$/.test(h.text) && j === i - 1) break;
+					// 논문 제목·각주 묶음은 머리가 될 수 없고, 인용 블록은 인용 블록끼리만 잇는다
+					if (h.large || h.synthetic || h.aside || !!h.quote !== !!p.quote) {
+						if (p.quote) break; // 인용 블록 조각은 바로 앞 인용 블록에만 잇는다(소제목 너머로 건너뛰지 않음)
+						continue;
+					}
+					// 인용 블록이 출처 괄호("(IA7)", "(Dale 1992: 393)")로 끝났으면 끝난 것이다
+					if (p.quote && /\([^()]*\d[^()]*\)$/.test(h.text)) break;
+					if (this.endsSentence(h.text)) continue;
+					// 제목 조각은 바로 앞에 있을 때만 머리로 본다(두 줄짜리 제목, 제목으로 오인된 짧은 첫 줄).
+					// 박스 안의 소제목("What this paper adds")을 건너뛰어 더 앞의 미완성 단락을 찾기 위함.
+					if (h.kind === "heading" && j !== i - 1) continue;
+					if (h.kind === "para" && h.text.length < 50) continue;
+					h.text = (h.text + " " + p.text).replace(/-\s+(?=[a-z])/g, "");
+					if (h.kind === "heading" && h.text.length > 80) h.kind = "para";
+					paras.splice(i, 1);
+					i--;
+					break;
+				}
+			}
+			return paras;
 		},
 
 		/**
@@ -1201,9 +1423,12 @@ ${e.stack || ""}`);
 				let last = cur[cur.length - 1];
 				let lastDone = !last || last.kind === "heading" || this.endsSentence(last.text);
 				let startsNew = p.kind === "heading" || !/^\p{Ll}/u.test(p.text);
-				let boundary = lastDone && startsNew;
+				// 제목으로 끝나는 구간은 만들지 않는다(제목과 그 본문이 다른 구간으로 갈라짐)
+				let boundary = lastDone && startsNew && !(last && last.kind === "heading" && p.kind !== "heading");
+				let next = len + p.text.length;
 				if (cur.length && p.kind === "heading" && len >= maxChars * 0.6 && lastDone) cut();
-				else if (cur.length && len + p.text.length > maxChars && (boundary || len + p.text.length > hardMax)) cut();
+				// 문장 중간에서는 hardMax를 넘어도 되도록 버티고(한국어는 반쪽 번역을 다시 잇기 어렵다), 3배에서만 강제로 자른다
+				else if (cur.length && next > maxChars && (boundary || next > (lastDone ? hardMax : maxChars * 3))) cut();
 				cur.push(p);
 				len += p.text.length;
 			}
@@ -1487,13 +1712,18 @@ ${e.stack || ""}`);
 				"- Use **double asterisks** to bold a term that is bolded or being defined in the source (e.g. **이론(Theory)**은 …).",
 				"- Reference list: when the bibliography begins, emit its heading as h1 \"참고문헌(References)\" followed by ONE paragraph: \"원문의 참고문헌 목록은 서지정보의 정확성을 위해 번역하지 않고 원문 표기를 유지한다.\" — then skip every entry. If the fragments are all bibliography entries (the list began in an earlier chunk), skip them all.",
 				"- Author biographies, acknowledgements and disclosure statements are translated as normal sections.",
-				"- If a fragment begins or ends mid-sentence, translate exactly what is there (the rest belongs to a neighbouring chunk); use the CONTEXT passages only to understand the sentence. Never invent or bracket missing words.",
+				"- A fragment that starts mid-sentence (lowercase) continues the nearest earlier fragment that ended mid-sentence — a sidebar box, table or figure was extracted in between. Join the two halves into ONE paragraph (its \"ids\" may then be non-adjacent, e.g. [3, 9]) and place the intervening box after it; never start a paragraph with an ellipsis.",
+				"- If a fragment begins or ends mid-sentence and its other half is not in this chunk, translate exactly what is there (the rest belongs to a neighbouring chunk); use the CONTEXT passages only to understand the sentence. Never invent or bracket missing words.",
 				"- Never output anything before or after the JSON array. Escape quotes inside strings. No HTML or Markdown other than ** for bold.",
 			].join("\n");
 			let user = `Paper: ${title}\n\n${context}FRAGMENTS TO TRANSLATE:\n${numbered}`;
 			let { text, usage } = await this.request({ system, user, maxTokens: 24000 });
 			HighlightMirror.log(`translate usage: ${JSON.stringify(usage)}`);
-			let arr = this.parseJSONArray(text);
+			return this.attachSources(this.parseJSONArray(text), paras);
+		},
+
+		/** Claude가 돌려준 블록에 원문 첫 단어들(src)과 페이지를 붙인다(대응표용). */
+		attachSources(arr, paras) {
 			let out = [];
 			for (let b of arr) {
 				if (!b || typeof b !== "object") continue;
@@ -1503,6 +1733,43 @@ ${e.stack || ""}`);
 				out.push(Object.assign({}, b, { type: String(b.type || "p"), page: p.page, src }));
 			}
 			return out;
+		},
+
+		/**
+		 * 재검수: 증상이 발견된 구간의 1차 번역 블록을 원문 조각과 함께 다시 보내 고친다.
+		 * 반쪽 문장 합치기, 지어낸 대괄호 삭제, 빠진 문장 복원만 하고 나머지는 그대로 두게 한다.
+		 * @param {Array<{index, reason}>} problems suspicious()가 찾은 증상
+		 * @returns 교정된 블록 배열(원문 대응 포함). 결과가 비거나 크게 줄면 예외.
+		 */
+		async reviewChunk(paras, blocks, { lang, title, before = "", after = "", problems = [] }) {
+			let numbered = paras.map((p, i) => `[${i + 1}] (page ${p.page}) ${p.text}`).join("\n\n");
+			let strip = ({ page, src, ...rest }) => rest;
+			let current = JSON.stringify(blocks.map(strip));
+			let issues = problems.map(p => `- block ${p.index + 1}: ${p.reason}`).join("\n");
+			let context = "";
+			if (before) context += `CONTEXT BEFORE (previous chunk's end, for reference only):\n…${before}\n\n`;
+			if (after) context += `CONTEXT AFTER (next chunk's start, for reference only):\n${after}…\n\n`;
+			let system = [
+				`You are checking a first-pass ${lang} translation of an academic paper against its source fragments. The translation is for the researcher's private study notes; the researcher legally holds the paper.`,
+				"You receive: the numbered SOURCE fragments, the CURRENT JSON blocks produced from them (same block format: ids, type, text/items/caption/header/rows/note), and a list of DETECTED ISSUES.",
+				"",
+				"Fix only these kinds of problems and leave everything else exactly as it is:",
+				"- A block that starts mid-sentence, with an ellipsis, or with a lowercase English word: it is the second half of a sentence whose first half is in an earlier block (a sidebar box, table or figure was extracted in between). Merge the two halves into ONE complete paragraph (list all source ids it covers; they may be non-adjacent) and keep the intervening box after it.",
+				"- Words in [square brackets] that are not in the source: remove them and translate what the source actually says.",
+				"- A paragraph that ends mid-sentence: complete it from the source if the rest is in these fragments; if the rest is only in CONTEXT AFTER, leave it as is.",
+				"- A source sentence that was omitted: add its translation in place.",
+				`- Keep terminology, names, citations and numbers as in the first pass. Do not re-translate or re-phrase correct text. Do not add commentary.`,
+				"Output ONLY the complete corrected JSON array of ALL blocks in reading order (not just the changed ones). Escape quotes inside strings.",
+			].join("\n");
+			let user = `Paper: ${title}\n\n${context}SOURCE FRAGMENTS:\n${numbered}\n\nCURRENT BLOCKS:\n${current}\n\nDETECTED ISSUES:\n${issues}`;
+			let { text, usage } = await this.request({ system, user, maxTokens: 24000 });
+			HighlightMirror.log(`recheck usage: ${JSON.stringify(usage)}`);
+			let arr = this.parseJSONArray(text).filter(b => b && typeof b === "object");
+			const size = (bs) => bs.reduce((n, b) => n + JSON.stringify(b).length, 0);
+			if (!arr.length || size(arr) < size(blocks.map(strip)) * 0.6) {
+				throw new Error(`재검수 결과가 비었거나 너무 짧습니다 (${arr.length} blocks)`);
+			}
+			return this.attachSources(arr, paras);
 		},
 
 		/**
